@@ -954,18 +954,19 @@ function renderAdminExpenses(body) {
     </div>
     <div class="card">
       <h2>Recent expenses</h2>
-      ${[...state.expenses].sort((a, b) => {
-        const paidA = a.id ? expenseTotals(a.id).paid : 0;
-        const paidB = b.id ? expenseTotals(b.id).paid : 0;
-        const needsA = a.payment_status !== 'Paid' || paidA > 0.005;
-        const needsB = b.payment_status !== 'Paid' || paidB > 0.005;
-        const balA = needsA ? a.total - paidA : 0;
-        const balB = needsB ? b.total - paidB : 0;
-        const owesA = balA > 0.005 ? 1 : 0;
-        const owesB = balB > 0.005 ? 1 : 0;
-        if (owesA !== owesB) return owesB - owesA;          // owing items first
-        return (a.date < b.date ? 1 : -1);                   // then newest first
-      }).slice(0, 20).map(x => {
+      ${(() => {
+        const withOwing = state.expenses.map(x => {
+          const paid = x.id ? expenseTotals(x.id).paid : 0;
+          const owes = (x.payment_status !== 'Paid' || paid > 0.005) && (x.total - paid) > 0.005;
+          return { x, owes };
+        });
+        const owingItems = withOwing.filter(o => o.owes).map(o => o.x)
+          .sort((a, b) => (a.date < b.date ? 1 : -1));
+        const settledItems = withOwing.filter(o => !o.owes).map(o => o.x)
+          .sort((a, b) => (a.date < b.date ? 1 : -1))
+          .slice(0, 20 - owingItems.length > 0 ? 20 - owingItems.length : 5);
+        return [...owingItems, ...settledItems];
+      })().map(x => {
         const paidSoFar = x.id ? expenseTotals(x.id).paid : 0;
         const needsTracking = x.payment_status !== 'Paid' || paidSoFar > 0.005;
         const t = { paid: needsTracking ? paidSoFar : x.total };
