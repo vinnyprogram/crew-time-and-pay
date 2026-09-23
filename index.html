@@ -557,11 +557,14 @@ function openWorker(empNum) {
 function renderWorker(app) {
   const emp = state.employees.find(e => e.employee_number === state.activeEmployee);
   if (!emp) { state.view = 'home'; return renderHome(app); }
-  const sixDaysAgo = new Date();
-  sixDaysAgo.setDate(sixDaysAgo.getDate() - 6);
-  const cutoff = sixDaysAgo.toISOString().slice(0, 10);
-  const recent = state.entries
-    .filter(e => e.employee_number === emp.employee_number && e.work_date >= cutoff);
+  // Unpaid days only: uses the same oldest-day-first payment matching as the
+  // Admin Payments tab / Custom Report, so both screens always agree on which
+  // days are paid. A shift that's still open always shows. Newest first, max 6.
+  const isOpenEntry = e => (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null);
+  const recent = computePaymentAllocation(emp.employee_number)
+    .filter(a => isOpenEntry(a) || a.status !== 'Paid')
+    .sort((a, b) => (a.work_date < b.work_date ? 1 : a.work_date > b.work_date ? -1 : Number(b.start_time) - Number(a.start_time)))
+    .slice(0, 6);
 
   const openEntry = state.entries.find(e =>
     e.employee_number === emp.employee_number && e.id &&
@@ -630,7 +633,7 @@ function renderWorker(app) {
       </div>
 
       <div class="card">
-        <h2>\u00daltimos 6 dias</h2>
+        <h2>Dias ainda n\u00e3o pagos</h2>
         ${recent.length ? recent.map(e => `
           <div class="entry">
             <div>
@@ -641,9 +644,9 @@ function renderWorker(app) {
                   : (Number(e.hours_worked) > 0 ? `${formatDecimalTime(e.start_time)}&ndash;${formatDecimalTime(e.finish_time)} &middot; ${e.hours_worked}h` : (e.notes || 'Pagamento por servi\u00e7o'))
               }</div>
             </div>
-            <div class="amt">${(e.finish_time === '' || e.finish_time === undefined || e.finish_time === null) ? '' : money(e.amount_earned)}</div>
+            <div class="amt" style="text-align:right;">${isOpenEntry(e) ? '' : (e.status === 'Partial' ? `${money(e.owedAmt)}<div class="d" style="font-weight:400;">falta (pago em parte)</div>` : money(e.amount_earned))}</div>
           </div>
-        `).join('') : `<div class="empty">Nenhum registro ainda</div>`}
+        `).join('') : `<div class="empty">Tudo pago \u2014 nenhum dia pendente</div>`}
       </div>
     </main>
   `;
