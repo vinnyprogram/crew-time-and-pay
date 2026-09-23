@@ -654,10 +654,42 @@ function toggleManualEntry() {
   if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
 }
 
+// Finds an existing entry for this employee/date whose time range overlaps
+// the proposed new one. Pass newFinish as null for a Clock In (finish not
+// known yet) -- then it just checks whether newStart falls inside an
+// existing range. An entry with no finish_time (still open) is treated as
+// running until end of day for this check.
+function findOverlappingEntry(empNum, date, newStart, newFinish) {
+  const sameDay = state.entries.filter(e => e.employee_number === empNum && e.work_date === date);
+  for (const e of sameDay) {
+    const eStart = Number(e.start_time);
+    const eEnd = (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null) ? 24 : Number(e.finish_time);
+    if (newFinish === null || newFinish === undefined) {
+      if (newStart >= eStart && newStart < eEnd) return e;
+    } else {
+      if (newStart < eEnd && eStart < newFinish) return e;
+    }
+  }
+  return null;
+}
+
+function describeEntry(e) {
+  return e.finish_time
+    ? `${e.start_time}\u2013${e.finish_time} (${e.hours_worked}h, ${money(e.amount_earned)})`
+    : `iniciado \u00e0s ${formatDecimalTime(e.start_time)}, ainda em aberto`;
+}
+
 async function clockIn(btn, empNum) {
   const emp = state.employees.find(e => e.employee_number === empNum);
   const startTime = readTimePicker('ci_start');
   if (isNaN(startTime)) { showToast('Informe o hor\u00e1rio de in\u00edcio', true); return; }
+
+  const conflict = findOverlappingEntry(empNum, todayStr(), startTime, null);
+  if (conflict) {
+    alert(`J\u00e1 existe um registro nesse hor\u00e1rio para hoje: ${describeEntry(conflict)}.\n\nEscolha outro hor\u00e1rio para registrar este dia.`);
+    return;
+  }
+
   await guardedSave(btn, 'Salvando\u2026', async () => {
     try {
       await gasPost('addEntry', {
@@ -698,6 +730,12 @@ async function submitEntry(btn, empNum) {
   const finish = readTimePicker('f_finish');
 
   if (!date || isNaN(start) || isNaN(finish)) { showToast('Preencha data, hor\u00e1rio de in\u00edcio e sa\u00edda', true); return; }
+
+  const conflict = findOverlappingEntry(empNum, date, start, finish);
+  if (conflict) {
+    alert(`J\u00e1 existe um registro nesse hor\u00e1rio em ${fmtDate(date)}: ${describeEntry(conflict)}.\n\nEscolha outro hor\u00e1rio para registrar este dia.`);
+    return;
+  }
 
   const hours = hoursBetween(start, finish);
   const rate = hourlyRate(emp);
