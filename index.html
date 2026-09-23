@@ -232,6 +232,15 @@ async function gasPost(action, payload) {
 // unless the page has already moved on (e.g. render() rebuilt the DOM).
 let savePending = false;
 
+// Lets every open tab of this app, on this same device, hear about a save
+// the instant another tab makes one -- so two tabs open side by side never
+// drift out of sync. Purely local to the device; never leaves the browser.
+const syncChannel = (typeof BroadcastChannel !== 'undefined')
+  ? new BroadcastChannel('crew_time_and_pay_sync') : null;
+if (syncChannel) {
+  syncChannel.onmessage = () => { if (!savePending) render(); };
+}
+
 async function guardedSave(btn, savingLabel, fn) {
   if (!btn || btn.disabled) return;
   const original = btn.textContent;
@@ -243,6 +252,7 @@ async function guardedSave(btn, savingLabel, fn) {
   } finally {
     savePending = false;
     if (btn.isConnected) { btn.disabled = false; btn.textContent = original; }
+    if (syncChannel) syncChannel.postMessage('refresh');
   }
 }
 
@@ -1369,6 +1379,16 @@ if (cached) {
   paintCurrentView();  // instant paint from last known data while render() refreshes in the background
 }
 render();
+
+// If the app was left open (phone locked, tab backgrounded, etc.) and the
+// person comes back to it, quietly pull fresh data -- no button needed.
+// render() already shows the existing view while it fetches in the
+// background, so this doesn't cause any jarring "loading" flash.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && !savePending) {
+    render();
+  }
+});
 </script>
 </body>
 </html>
