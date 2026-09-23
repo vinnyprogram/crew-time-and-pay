@@ -420,6 +420,15 @@ function hourlyRate(emp) {
   return emp.daily_rate / emp.standard_hours;
 }
 
+// Pay for a day's hours, capped at the employee's agreed daily rate once
+// they hit their standard hours -- working past that doesn't earn more,
+// it just tops out at the flat daily amount (e.g. Julio: $350 for 9h+).
+function amountForHours(hours, emp) {
+  const raw = Math.round(hours * hourlyRate(emp) * 100) / 100;
+  const cap = Number(emp.daily_rate) || raw;
+  return Math.min(raw, cap);
+}
+
 /* ============================================================
    Local cache -- lets the app paint instantly from the last known
    data while it quietly re-fetches from the (slower) Apps Script
@@ -661,7 +670,7 @@ async function clockOut(btn, id, empNum) {
   if (isNaN(finishTime)) { showToast('Informe o hor\u00e1rio de sa\u00edda', true); return; }
   const hours = hoursBetween(openEntry.start_time, finishTime);
   const rate = hourlyRate(emp);
-  const amount = Math.round(hours * rate * 100) / 100;
+  const amount = amountForHours(hours, emp);
   await guardedSave(btn, 'Salvando\u2026', async () => {
     try {
       await gasPost('updateEntry', { id, patch: { finish_time: finishTime, hours_worked: hours, amount_earned: amount } });
@@ -682,7 +691,7 @@ async function submitEntry(btn, empNum) {
 
   const hours = hoursBetween(start, finish);
   const rate = hourlyRate(emp);
-  const amount = Math.round(hours * rate * 100) / 100;
+  const amount = amountForHours(hours, emp);
 
   await guardedSave(btn, 'Salvando\u2026', async () => {
     try {
