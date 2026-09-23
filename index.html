@@ -860,18 +860,18 @@ async function addEmployee() {
 }
 
 function renderAdminPayments(body) {
-  const rollingFrom = new Date();
-  rollingFrom.setDate(rollingFrom.getDate() - 6);
   const defaults = state.paymentFormDefaults || {};
-  const fromDefault = defaults.from || rollingFrom.toISOString().slice(0, 10);
-  const toDefault = defaults.to || todayStr();
-  const empDefault = defaults.empNum;
+  const empDefault = (defaults.empNum !== undefined) ? defaults.empNum
+    : (state.employees[0] ? state.employees[0].employee_number : undefined);
+  // "From" always starts on this employee's first unpaid day (or today if all paid).
+  const fromDefault = firstUnpaidDate(empDefault) || todayStr();
+  const toDefault = todayStr();
 
   body.innerHTML = `
     <div class="card">
       <h2>Record a payment</h2>
       <label>Employee</label>
-      <select id="p_emp" onchange="recalcPaymentRange()">
+      <select id="p_emp" onchange="onPaymentEmployeeChange()">
         ${state.employees.map(e => `<option value="${e.employee_number}" ${empDefault === e.employee_number ? 'selected' : ''}>${escapeHtml(e.name)}</option>`).join('')}
       </select>
       <label>Covers days from</label>
@@ -916,6 +916,20 @@ function renderAdminPayments(body) {
   recalcPaymentRange();
 }
 
+// Oldest day this employee still has money owed on (same matching as the
+// Custom Report), or null if everything is paid.
+function firstUnpaidDate(empNum) {
+  if (empNum === undefined || empNum === null) return null;
+  const first = computePaymentAllocation(empNum).find(a => a.owedAmt > 0.005);
+  return first ? first.work_date : null;
+}
+
+function onPaymentEmployeeChange() {
+  const empNum = parseInt(document.getElementById('p_emp').value, 10);
+  document.getElementById('p_from').value = firstUnpaidDate(empNum) || todayStr();
+  recalcPaymentRange();
+}
+
 function recalcPaymentRange() {
   const empNum = parseInt(document.getElementById('p_emp').value, 10);
   const from = document.getElementById('p_from').value;
@@ -923,11 +937,12 @@ function recalcPaymentRange() {
   const breakdownEl = document.getElementById('p_breakdown');
   if (!from || !to) return;
 
-  const inRange = state.entries.filter(e =>
-    e.employee_number === empNum && e.work_date >= from && e.work_date <= to
-  ).sort((a, b) => (a.work_date < b.work_date ? -1 : 1));
+  const inRange = computePaymentAllocation(empNum).filter(e =>
+    e.work_date >= from && e.work_date <= to
+  );
 
-  const wagesTotal = inRange.reduce((s, e) => s + Number(e.amount_earned || 0), 0);
+  // Suggest only what's still owed, so a partly-paid first day isn't paid twice.
+  const wagesTotal = inRange.reduce((s, e) => s + e.owedAmt, 0);
   document.getElementById('p_wages').value = wagesTotal ? (Math.round(wagesTotal * 100) / 100) : '';
   // Gas amount is entered manually by you (e.g. a flat weekly $70) -- not auto-calculated,
   // since gas is no longer tied to any specific day's hours.
@@ -937,6 +952,9 @@ function recalcPaymentRange() {
   } else {
     breakdownEl.innerHTML = 'Days included: ' + inRange.map(e => {
       const label = Number(e.hours_worked) > 0 ? fmtDate(e.work_date) : `${fmtDate(e.work_date)} \u2013 ${escapeHtml(e.notes || 'job')}`;
+      if (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null) return `${label} (still clocked in)`;
+      if (e.status === 'Paid') return `${label} (already paid)`;
+      if (e.status === 'Partial') return `${label} (${money(e.owedAmt)} left of ${money(e.amount_earned)})`;
       return `${label} (${money(e.amount_earned)})`;
     }).join(', ');
   }
@@ -969,7 +987,7 @@ async function submitPayment(btn) {
         }
       });
       showToast(`Saved: ${money(wages + gas)} total`);
-      state.paymentFormDefaults = { empNum, from: addOneDay(to), to: todayStr() };
+      state.paymentFormDefaults = { empNum };
       render();
     } catch (err) { showToast(err.message, true); }
   });
