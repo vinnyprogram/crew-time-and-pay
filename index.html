@@ -582,7 +582,7 @@ function renderWorker(app) {
       ${todayDone && !openEntry ? `
       <div class="card" style="background:#EAF7EE; border-color:var(--good);">
         <div style="color:var(--good); font-weight:700; font-size:15px;">\u2713 Hoje j\u00e1 registrado</div>
-        <div style="font-size:14px; color:var(--ink-soft); margin-top:4px;">${todayDone.start_time}&ndash;${todayDone.finish_time} &middot; ${todayDone.hours_worked}h &middot; ${money(todayDone.amount_earned)}</div>
+        <div style="font-size:14px; color:var(--ink-soft); margin-top:4px;">${formatDecimalTime(todayDone.start_time)}&ndash;${formatDecimalTime(todayDone.finish_time)} &middot; ${todayDone.hours_worked}h &middot; ${money(todayDone.amount_earned)}</div>
       </div>
       ` : ''}
 
@@ -638,10 +638,10 @@ function renderWorker(app) {
               <div class="d">${
                 (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null)
                   ? `Iniciado \u00e0s ${formatDecimalTime(e.start_time)} \u2014 ainda trabalhando`
-                  : (Number(e.hours_worked) > 0 ? `${e.start_time}&ndash;${e.finish_time} &middot; ${e.hours_worked}h` : (e.notes || 'Pagamento por servi\u00e7o'))
+                  : (Number(e.hours_worked) > 0 ? `${formatDecimalTime(e.start_time)}&ndash;${formatDecimalTime(e.finish_time)} &middot; ${e.hours_worked}h` : (e.notes || 'Pagamento por servi\u00e7o'))
               }</div>
             </div>
-            <div class="amt">${e.amount_earned !== '' ? money(e.amount_earned) : ''}</div>
+            <div class="amt">${(e.finish_time === '' || e.finish_time === undefined || e.finish_time === null) ? '' : money(e.amount_earned)}</div>
           </div>
         `).join('') : `<div class="empty">Nenhum registro ainda</div>`}
       </div>
@@ -675,7 +675,7 @@ function findOverlappingEntry(empNum, date, newStart, newFinish) {
 
 function describeEntry(e) {
   return e.finish_time
-    ? `${e.start_time}\u2013${e.finish_time} (${e.hours_worked}h, ${money(e.amount_earned)})`
+    ? `${formatDecimalTime(e.start_time)}\u2013${formatDecimalTime(e.finish_time)} (${e.hours_worked}h, ${money(e.amount_earned)})`
     : `iniciado \u00e0s ${formatDecimalTime(e.start_time)}, ainda em aberto`;
 }
 
