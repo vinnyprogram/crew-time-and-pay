@@ -682,6 +682,27 @@ function describeEntry(e) {
     : `iniciado \u00e0s ${formatDecimalTime(e.start_time)}, ainda em aberto`;
 }
 
+// Updates the screen right away after a successful save (adds the new entry,
+// or merges changes into an existing one), instead of leaving the old screen
+// up while the slow full refresh from Google runs in the background.
+function applyLocalEntry(entry) {
+  const i = state.entries.findIndex(e => e.id === entry.id);
+  if (i > -1) state.entries[i] = { ...state.entries[i], ...entry };
+  else state.entries.unshift(entry);
+  saveCache();
+  paintCurrentView();
+}
+
+// A save can reach the sheet even when the phone never hears back (weak
+// signal). So on any failure, re-check the real data instead of assuming it
+// didn't save -- if it did, the screen catches up; if not, it's safe to retry
+// (the backend ignores repeat clock-ins).
+function saveFailed(err) {
+  const network = err instanceof TypeError || (err && err.name === 'SyntaxError');
+  showToast(network ? 'Sem sinal? Verificando se foi salvo\u2026' : err.message, true);
+  render();
+}
+
 async function clockIn(btn, empNum) {
   const emp = state.employees.find(e => e.employee_number === empNum);
   const startTime = readTimePicker('ci_start');
@@ -695,15 +716,21 @@ async function clockIn(btn, empNum) {
 
   await guardedSave(btn, 'Salvando\u2026', async () => {
     try {
-      await gasPost('addEntry', {
+      const result = await gasPost('addEntry', {
         entry: {
           employee_number: empNum, work_date: todayStr(), start_time: startTime, finish_time: '',
           hours_worked: '', hourly_rate: hourlyRate(emp), amount_earned: '', gasolina: 0, notes: ''
         }
       });
-      showToast(`Ponto de entrada \u00e0s ${formatDecimalTime(startTime)}`);
+      showToast(result.duplicate
+        ? 'Voc\u00ea j\u00e1 tinha batido o ponto \u2014 nada foi duplicado'
+        : `Ponto de entrada \u00e0s ${formatDecimalTime(startTime)}`);
+      if (result.id) applyLocalEntry({
+        id: result.id, employee_number: empNum, work_date: todayStr(), start_time: startTime, finish_time: '',
+        hours_worked: 0, hourly_rate: hourlyRate(emp), amount_earned: 0, gasolina: 0, notes: ''
+      });
       render();
-    } catch (err) { showToast(err.message, true); }
+    } catch (err) { saveFailed(err); }
   });
 }
 
@@ -720,8 +747,9 @@ async function clockOut(btn, id, empNum) {
     try {
       await gasPost('updateEntry', { id, patch: { finish_time: finishTime, hours_worked: hours, amount_earned: amount } });
       showToast(`Ponto de sa\u00edda: ${hours}h, ${money(amount)}`);
+      applyLocalEntry({ id, finish_time: finishTime, hours_worked: hours, amount_earned: amount });
       render();
-    } catch (err) { showToast(err.message, true); }
+    } catch (err) { saveFailed(err); }
   });
 }
 
@@ -746,19 +774,19 @@ async function submitEntry(btn, empNum) {
 
   await guardedSave(btn, 'Salvando\u2026', async () => {
     try {
-      await gasPost('addEntry', {
+      const result = await gasPost('addEntry', {
         entry: {
           employee_number: empNum, work_date: date, start_time: start, finish_time: finish,
           hours_worked: hours, hourly_rate: rate, amount_earned: amount, gasolina: 0, notes
         }
       });
-      showToast(`Salvo: ${hours}h, ${money(amount)}`);
-      document.getElementById('f_date').value = todayStr();
-      document.getElementById('f_notes').value = '';
+      showToast(result.duplicate ? 'Esse dia j\u00e1 estava salvo \u2014 nada foi duplicado' : `Salvo: ${hours}h, ${money(amount)}`);
+      if (result.id) applyLocalEntry({
+        id: result.id, employee_number: empNum, work_date: date, start_time: start, finish_time: finish,
+        hours_worked: hours, hourly_rate: rate, amount_earned: amount, gasolina: 0, notes
+      });
       render();
-    } catch (err) {
-      showToast(err.message, true);
-    }
+    } catch (err) { saveFailed(err); }
   });
 }
 
@@ -795,6 +823,7 @@ function renderAdmin(app) {
       <div class="admin-link" onclick="render()" style="color:#BFD0DA; margin-top:4px;">\u21bb Refresh data</div>
     </header>
     <main>
+      ${renderOverlapWarning()}
       <div class="tabs">
         <div class="tab ${state.adminTab === 'employees' ? 'active' : ''}" onclick="setAdminTab('employees')">Employees</div>
         <div class="tab ${state.adminTab === 'payments' ? 'active' : ''}" onclick="setAdminTab('payments')">Payments</div>
@@ -810,6 +839,67 @@ function renderAdmin(app) {
   if (state.adminTab === 'expenses') return renderAdminExpenses(body);
   if (state.adminTab === 'summary') return renderAdminSummary(body);
 }
+// Finds pairs of entries for the same employee on the same day whose times
+// overlap. Exact duplicates are already removed automatically by the backend,
+// so anything left here is a real conflict that needs a person to decide.
+function findOverlapPairs() {
+  const isOpen = e => (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null);
+  const timed = state.entries.filter(e => e.start_time !== '' && e.start_time !== null && e.start_time !== undefined && !isNaN(Number(e.start_time)));
+  const pairs = [];
+  for (let i = 0; i < timed.length; i++) {
+    for (let j = i + 1; j < timed.length; j++) {
+      const a = timed[i], b = timed[j];
+      if (a.employee_number !== b.employee_number || a.work_date !== b.work_date) continue;
+      const aEnd = isOpen(a) ? 24 : Number(a.finish_time), bEnd = isOpen(b) ? 24 : Number(b.finish_time);
+      if (Number(a.start_time) < bEnd && Number(b.start_time) < aEnd) pairs.push([a, b]);
+    }
+  }
+  return pairs;
+}
+
+function renderOverlapWarning() {
+  const pairs = findOverlapPairs();
+  if (!pairs.length) return '';
+  const line = e => {
+    const open = (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null);
+    const txt = open
+      ? `${formatDecimalTime(e.start_time)} \u2013 still clocked in`
+      : `${formatDecimalTime(e.start_time)}\u2013${formatDecimalTime(e.finish_time)} &middot; ${e.hours_worked}h &middot; ${money(e.amount_earned)}`;
+    return `<div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0;">
+      <span style="font-size:13px;">${txt}</span>
+      ${e.id ? `<button class="small danger" onclick="deleteEntry(this, '${e.id}')">Delete</button>` : `<span class="d">edit in sheet</span>`}
+    </div>`;
+  };
+  return `
+    <div class="card no-print" style="border-color:var(--bad); background:#FDF0EE;">
+      <h2 style="color:var(--bad);">\u26a0 Overlapping hours</h2>
+      <div style="font-size:12.5px; color:var(--ink-soft); margin-bottom:8px;">These entries cover the same time on the same day. Delete the wrong one so pay isn't counted twice.</div>
+      ${pairs.map(([a, b]) => {
+        const emp = state.employees.find(x => x.employee_number === a.employee_number);
+        return `<div style="border-top:1px solid var(--line); padding-top:8px; margin-top:8px;">
+          <div style="font-weight:700; font-size:14px;">${emp ? escapeHtml(emp.name) : 'Employee ' + a.employee_number} &middot; ${fmtDate(a.work_date)}</div>
+          ${line(a)}${line(b)}
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+async function deleteEntry(btn, id) {
+  const e = state.entries.find(x => x.id === id);
+  if (!e) return;
+  if (!confirm(`Delete this entry (${fmtDate(e.work_date)}, starting ${formatDecimalTime(e.start_time)})?\n\nA copy is kept in the RemovedEntries tab of the sheet.`)) return;
+  await guardedSave(btn, 'Deleting\u2026', async () => {
+    try {
+      await gasPost('deleteEntry', { id });
+      state.entries = state.entries.filter(x => x.id !== id);
+      saveCache();
+      paintCurrentView();
+      showToast('Entry deleted');
+      render();
+    } catch (err) { showToast(err.message, true); render(); }
+  });
+}
+
 function setAdminTab(tab) { if (blockedBySavePending()) return; state.adminTab = tab; paintCurrentView(); }
 
 function renderAdminEmployees(body) {
