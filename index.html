@@ -1,1543 +1,381 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Crew Time &amp; Pay</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-  /* =================== CONFIG =================== */
-  /* Fill these in after you create your Supabase project. */
-</style>
-</head>
-<body>
+/**
+ * Crew Time & Pay -- Apps Script backend
+ *
+ * SETUP:
+ * 1. In your Google Sheet: Extensions -> Apps Script.
+ * 2. Delete any starter code, paste this whole file in, and Save.
+ * 3. Click Deploy -> New deployment -> gear icon -> "Web app".
+ *      Execute as:      Me
+ *      Who has access:  Anyone
+ *    Click Deploy, authorize it, and copy the Web app URL (ends in /exec).
+ * 4. Paste that URL into GAS_URL near the top of index_gsheets.html.
+ *
+ * Your spreadsheet needs exactly 4 tabs with these header rows (row 1):
+ *
+ *   Employees:    employee_number | name | daily_rate | standard_hours | color
+ *   TimeEntries:  id | work_date | employee_number | start_time | finish_time | hours_worked | hourly_rate | amount_earned | gasolina | notes   (id is generated automatically; finish_time is blank while someone is clocked in)
+ *   Payments:     payment_date | employee_number | wages_amount | gas_amount | covers_from | covers_to   (one row per payment; gas_amount is entered manually, not tied to any day's entries)
+ *   Expenses:     id | date | category | description | vendor | qty | unit_cost | total | payment_status | payment_date | notes | receipt_url
+ *   ExpensePayments: expense_id | payment_date | amount   (one row per installment paid toward an expense; expense_id must match an Expenses row's id)   (id is generated automatically -- leave it blank when adding rows by hand)
+ *
+ * IMPORTANT: select the work_date/start_time/finish_time/payment_date/date
+ * columns in each sheet and set Format -> Number -> Plain text BEFORE
+ * entering any data. Otherwise Sheets "helpfully" reformats dates/times
+ * and the app's calculations will read them back wrong.
+ */
 
-<script>
-/* ============================================================
-   1) FILL THIS IN -- your Apps Script Web App URL (ends in /exec)
-   ============================================================ */
-const GAS_URL = "https://script.google.com/macros/s/AKfycbzWQtQpBibbVh0QoO-8aARoUu7tylKoeuXTv-tkpv4qkMi5LerpwKt1YS6E2_8_CqN6/exec";
-
-/* Change this to lock the Admin screen to a PIN of your choosing. */
-const ADMIN_PIN = "1234";
-</script>
-
-<style>
-  :root{
-    --bg: #F2F0EA;
-    --panel: #FFFFFF;
-    --ink: #201F1B;
-    --ink-soft: #63615A;
-    --line: #DEDACE;
-    --accent: #E85D2C;
-    --accent-ink: #FFFFFF;
-    --steel: #2F4A5E;
-    --good: #2E7D52;
-    --bad: #C0392B;
-    --radius: 14px;
+function doGet(e) {
+  var action = e.parameter.action;
+  if (action === 'all') {
+    // Quietly remove exact duplicate time entries before sending data to the
+    // app. Never allowed to block loading -- if anything goes wrong, skip it.
+    try {
+      var lock = LockService.getScriptLock();
+      if (lock.tryLock(5000)) {
+        try { cleanDuplicateEntries_(); SpreadsheetApp.flush(); } finally { lock.releaseLock(); }
+      }
+    } catch (err) { /* ignore -- loading data matters more */ }
+    return jsonOut({
+      employees: sheetToObjects('Employees'),
+      entries: sheetToObjects('TimeEntries'),
+      payments: sheetToObjects('Payments'),
+      expenses: sheetToObjects('Expenses'),
+      expensePayments: sheetToObjects('ExpensePayments')
+    });
   }
-  *{ box-sizing: border-box; }
-  html,body{ height:100%; }
-  body{
-    margin:0;
-    background:var(--bg);
-    color:var(--ink);
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-    -webkit-font-smoothing: antialiased;
-    padding-top: env(safe-area-inset-top,0px);
-    padding-bottom: env(safe-area-inset-bottom,0px);
-  }
-  h1,h2,h3, .display{
-    font-family: 'Barlow Condensed', 'Inter', sans-serif;
-    font-weight: 700;
-    letter-spacing: 0.2px;
-    margin: 0;
-  }
-  .app{ max-width: 560px; margin: 0 auto; min-height:100%; display:flex; flex-direction:column; }
-
-  header.top{
-    background: var(--steel);
-    color: #fff;
-    padding: 18px 20px 16px;
-    position: sticky; top:0; z-index: 5;
-    padding-top: calc(18px + env(safe-area-inset-top,0px));
-  }
-  header.top .row{ display:flex; align-items:center; gap:10px; }
-  header.top h1{ font-size: 26px; line-height:1; }
-  header.top .sub{ color:#BFD0DA; font-size:13px; margin-top:2px; }
-  .back{
-    background:none; border:none; color:#fff; font-size:15px;
-    padding:6px 0; cursor:pointer; display:flex; align-items:center; gap:6px;
-    font-family:'Inter',sans-serif; font-weight:600;
-  }
-  .back svg{ width:18px; height:18px; }
-
-  main{ flex:1; padding: 18px 16px 40px; }
-
-  /* --- employee grid --- */
-  .grid{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top: 6px; }
-  .tile{
-    background:var(--panel); border-radius: var(--radius);
-    border: 1px solid var(--line); border-left: 7px solid var(--tile-color, var(--accent));
-    padding: 16px 14px; text-align:left; cursor:pointer;
-    font-family:'Inter',sans-serif;
-    box-shadow: 0 1px 2px rgba(20,20,15,0.04);
-  }
-  .tile:active{ transform: scale(0.98); }
-  .tile .name{ font-weight:700; font-size:17px; margin-bottom:2px; }
-  .tile .rate{ color:var(--ink-soft); font-size:13px; }
-  .addTile{
-    border: 1.5px dashed var(--line); background:transparent; border-radius:var(--radius);
-    display:flex; align-items:center; justify-content:center; color:var(--ink-soft);
-    font-weight:600; font-size:14px; cursor:pointer; min-height:64px;
-  }
-
-  /* --- cards / sections --- */
-  .card{
-    background: var(--panel); border:1px solid var(--line); border-radius: var(--radius);
-    padding: 18px 16px; margin-bottom: 16px;
-  }
-  .card h2{ font-size:20px; margin-bottom: 10px; }
-  .stat-row{ display:flex; gap:12px; }
-  .stat{ flex:1; background:#F7F5F0; border-radius:10px; padding:12px; text-align:center; }
-  .stat .num{ font-family:'Barlow Condensed',sans-serif; font-weight:700; font-size:24px; }
-  .stat .lbl{ font-size:11.5px; color:var(--ink-soft); text-transform:uppercase; letter-spacing:0.4px; }
-
-  label{ display:block; font-size:13px; font-weight:600; color:var(--ink-soft); margin: 12px 0 5px; }
-  label:first-of-type{ margin-top:0; }
-  input, select{
-    width:100%; padding: 12px 12px; border-radius:10px; border:1.5px solid var(--line);
-    font-size:16px; font-family:'Inter',sans-serif; background:#fff; color:var(--ink);
-  }
-  input:focus, select:focus{ outline:none; border-color: var(--accent); }
-  .two-col{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-
-  button.primary{
-    width:100%; margin-top:16px; background:var(--accent); color:var(--accent-ink);
-    border:none; padding:14px; border-radius:10px; font-size:16px; font-weight:700;
-    font-family:'Inter',sans-serif; cursor:pointer;
-  }
-  button.primary:active{ opacity:0.85; }
-  button.secondary{
-    width:100%; margin-top:10px; background:transparent; color:var(--steel);
-    border:1.5px solid var(--steel); padding:12px; border-radius:10px; font-size:15px;
-    font-weight:600; font-family:'Inter',sans-serif; cursor:pointer;
-  }
-  button.small{
-    background:var(--steel); color:#fff; border:none; padding:8px 12px; border-radius:8px;
-    font-size:13px; font-weight:600; cursor:pointer; font-family:'Inter',sans-serif;
-  }
-  button.small.danger{ background:var(--bad); }
-
-  .entry{
-    display:flex; justify-content:space-between; align-items:center;
-    padding: 10px 0; border-bottom: 1px solid var(--line); font-size:14px;
-  }
-  .entry:last-child{ border-bottom:none; }
-  .entry .d{ color:var(--ink-soft); font-size:12.5px; }
-  .entry .amt{ font-weight:700; }
-
-  .toast{
-    position:fixed; left:50%; bottom:28px; transform:translateX(-50%);
-    background: var(--good); color:#fff; padding:12px 20px; border-radius: 30px;
-    font-size:14px; font-weight:600; box-shadow:0 4px 14px rgba(0,0,0,0.2);
-    opacity:0; pointer-events:none; transition: opacity 0.25s, bottom 0.25s; z-index: 50;
-  }
-  .toast.show{ opacity:1; bottom:calc(40px + env(safe-area-inset-bottom,0px)); }
-  .toast.err{ background: var(--bad); }
-
-  .admin-link{
-    text-align:center; padding: 6px 0 4px; color: var(--ink-soft); font-size:12.5px;
-    text-decoration:underline; cursor:pointer;
-  }
-
-  .tabs{ display:flex; gap:6px; margin-bottom:16px; }
-  .tab{
-    flex:1; text-align:center; padding:9px 4px; border-radius:10px; font-weight:700;
-    font-size:12.5px; cursor:pointer; background:#EDEAE2; color:var(--ink-soft);
-  }
-  .tab.active{ background: var(--steel); color:#fff; }
-
-  .emp-row{ display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--line); }
-  .emp-row:last-child{ border-bottom:none; }
-  .swatch{ width:14px; height:14px; border-radius:4px; flex-shrink:0; }
-  .emp-row .fields{ flex:1; display:grid; grid-template-columns: 1.4fr 0.8fr 0.8fr 0.9fr; gap:6px; }
-  .emp-row input, .emp-row select{ padding:8px; font-size:13px; }
-
-  table.summary{ width:100%; border-collapse: collapse; font-size:13px; }
-  table.summary th, table.summary td{ text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
-  table.summary th{ color:var(--ink-soft); font-weight:600; font-size:11.5px; text-transform:uppercase; }
-
-  .empty{ text-align:center; color:var(--ink-soft); padding: 30px 10px; font-size:14px; }
-  .pin-box{ display:flex; justify-content:center; align-items:center; min-height:60vh; flex-direction:column; gap:14px; }
-  .pin-box input{ width:160px; text-align:center; letter-spacing:6px; font-size:22px; }
-
-  @media print {
-    header.top, .tabs, .admin-link, .no-print { display: none !important; }
-    body { background: #fff; padding-top: 0; }
-    .app { max-width: 100%; }
-    main { padding: 0; }
-    .card { border: 1px solid #999; box-shadow: none; break-inside: avoid; margin-bottom: 14px; }
-    .print-only { display: block !important; }
-    table.summary th, table.summary td { border-bottom: 1px solid #ccc; }
-  }
-</style>
-
-<div class="app" id="app"></div>
-<div class="toast" id="toast"></div>
-
-<script>
-/* ============================================================
-   Colors -- same names as the Employees dropdown in your Excel
-   ============================================================ */
-const COLORS = {
-  Red:'#E8544A', Orange:'#F2994A', Yellow:'#D8A400', Green:'#27AE60',
-  Teal:'#178A8F', Blue:'#2F80ED', Purple:'#9B51E0', Gray:'#8A887F'
-};
-
-/* ============================================================
-   Google Apps Script helpers (no library needed -- plain fetch)
-   GET  ?action=all             -> {employees, entries, payments}
-   POST {action, ...payload}    -> {ok:true} or {error:"..."}
-   NOTE: POST uses Content-Type text/plain on purpose -- this avoids
-   a CORS preflight request, which Apps Script Web Apps don't handle.
-   ============================================================ */
-async function gasGet() {
-  const res = await fetch(`${GAS_URL}?action=all`);
-  if (!res.ok) throw new Error(`Sheet request failed: ${res.status}`);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  return data;
-}
-async function gasPost(action, payload) {
-  const res = await fetch(GAS_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ action, ...payload })
-  });
-  if (!res.ok) throw new Error(`Sheet request failed: ${res.status}`);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  return data;
+  return jsonOut({ error: 'Unknown action: ' + action });
 }
 
-/* ============================================================
-   Time math -- mirrors the Excel MOD(Finish-Start,24) formula
-   ============================================================ */
-// Disables a button and shows a saving label the instant it's tapped, so a
-// second tap while the (slow) Apps Script request is still in flight can't
-// create a duplicate row. Re-enables the button once the request finishes --
-// unless the page has already moved on (e.g. render() rebuilt the DOM).
-let savePending = false;
-
-// Lets every open tab of this app, on this same device, hear about a save
-// the instant another tab makes one -- so two tabs open side by side never
-// drift out of sync. Purely local to the device; never leaves the browser.
-const syncChannel = (typeof BroadcastChannel !== 'undefined')
-  ? new BroadcastChannel('crew_time_and_pay_sync') : null;
-if (syncChannel) {
-  syncChannel.onmessage = () => { if (!savePending) render(); };
-}
-
-async function guardedSave(btn, savingLabel, fn) {
-  if (!btn || btn.disabled) return;
-  const original = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = savingLabel;
-  savePending = true;
+function doPost(e) {
   try {
-    await fn();
-  } finally {
-    savePending = false;
-    if (btn.isConnected) { btn.disabled = false; btn.textContent = original; }
-    if (syncChannel) syncChannel.postMessage('refresh');
-  }
-}
+    var body = JSON.parse(e.postData.contents);
+    var action = body.action;
 
-// Call at the top of any navigation function. Returns true (and blocks the
-// navigation) if a save is still being written to the sheet -- this is what
-// stops someone from tapping "back" mid-save and accidentally being shown a
-// stale "not clocked in yet" screen that invites a duplicate submission.
-function blockedBySavePending() {
-  if (savePending) {
-    showToast('Aguarde, salvando\u2026', true);
-    return true;
-  }
-  return false;
-}
-
-function hoursBetween(startHrs, finishHrs) {
-  let diff = Number(finishHrs) - Number(startHrs);
-  diff = ((diff % 24) + 24) % 24;
-  diff = Math.max(diff - 1, 0);  // 1-hour lunch deduction, same as the Excel formula
-  return Math.round(diff * 100) / 100;
-}
-
-function currentTimeDecimal() {
-  const now = new Date();
-  return Math.round((now.getHours() + now.getMinutes() / 60) * 100) / 100;
-}
-
-// A simple Hour : Minute dropdown picker that always shows 24h format,
-// regardless of the phone's own time-format setting (unlike the native
-// <input type="time">, whose display follows each device's own locale).
-function timePickerHTML(idPrefix, decimalValue) {
-  let h = null, m = null;
-  if (decimalValue !== null && decimalValue !== undefined && decimalValue !== '') {
-    h = Math.floor(Number(decimalValue));
-    m = Math.round((Number(decimalValue) - h) * 60);
-    m = Math.round(m / 5) * 5;
-    if (m === 60) { m = 0; h = (h + 1) % 24; }
-  }
-  const hourOptions = (h === null ? `<option value="x" selected>--</option>` : '') +
-    Array.from({ length: 24 }, (_, i) => `<option value="${i}" ${i === h ? 'selected' : ''}>${String(i).padStart(2, '0')}</option>`).join('');
-  const minOptions = (m === null ? `<option value="x" selected>--</option>` : '') +
-    Array.from({ length: 12 }, (_, i) => i * 5).map(mm => `<option value="${mm}" ${mm === m ? 'selected' : ''}>${String(mm).padStart(2, '0')}</option>`).join('');
-  return `
-    <div style="display:flex; align-items:center; gap:8px;">
-      <select id="${idPrefix}_h">${hourOptions}</select>
-      <span style="font-weight:700; font-size:20px; color:var(--ink-soft);">:</span>
-      <select id="${idPrefix}_m">${minOptions}</select>
-    </div>`;
-}
-
-function readTimePicker(idPrefix) {
-  const h = document.getElementById(`${idPrefix}_h`).value;
-  const m = document.getElementById(`${idPrefix}_m`).value;
-  const hNum = Number(h), mNum = Number(m);
-  if (h === 'x' || m === 'x' || isNaN(hNum) || isNaN(mNum)) return NaN;
-  return Math.round((hNum + mNum / 60) * 100) / 100;
-}
-
-// Turns a native time input's "HH:MM" value into our internal decimal hour (7, 17.5, ...)
-function hhmmToDecimal(hhmm) {
-  if (!hhmm) return NaN;
-  const [h, m] = hhmm.split(':').map(Number);
-  return Math.round((h + m / 60) * 100) / 100;
-}
-
-// Turns a decimal hour (7, 17.5, ...) into a readable 24h clock time (07:00, 17:30)
-function formatDecimalTime(dec) {
-  const h24 = Math.floor(Number(dec));
-  const mins = Math.round((Number(dec) - h24) * 60);
-  return `${String(h24).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
-}
-function money(n) {
-  return '$' + (Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-function todayStr() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10);
-}
-
-/* ============================================================
-   Tiny state / router
-   ============================================================ */
-const state = {
-  view: 'home',          // home | worker | adminGate | admin
-  employees: [],
-  entries: [],
-  payments: [],
-  expenses: [],
-  expensePayments: [],
-  activeEmployee: null,
-  adminTab: 'employees',
-  paymentFormDefaults: null,  // remembers employee + next start date after a payment save
-  customReport: null,  // { empNum: 'all'|number, from, to } for the Summary tab's filtered report
-  configured: GAS_URL.indexOf('YOUR-DEPLOYMENT-ID') === -1
-};
-
-function showToast(msg, isErr) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'toast show' + (isErr ? ' err' : '');
-  setTimeout(() => { t.className = 'toast'; }, 2200);
-}
-
-async function loadAll() {
-  const data = await gasGet();
-  state.employees = (data.employees || []).map(e => ({
-    ...e,
-    employee_number: Number(e.employee_number),
-    daily_rate: Number(e.daily_rate),
-    standard_hours: Number(e.standard_hours)
-  })).sort((a, b) => a.employee_number - b.employee_number);
-  state.entries = (data.entries || []).map(e => ({
-    ...e,
-    employee_number: Number(e.employee_number),
-    hours_worked: Number(e.hours_worked),
-    hourly_rate: Number(e.hourly_rate),
-    amount_earned: Number(e.amount_earned),
-    gasolina: Number(e.gasolina || 0)
-  })).sort((a, b) => (a.work_date < b.work_date ? 1 : -1));
-  state.payments = (data.payments || []).map(p => ({
-    ...p,
-    employee_number: Number(p.employee_number),
-    amount: Number(p.amount)
-  })).sort((a, b) => (a.payment_date < b.payment_date ? 1 : -1));
-  state.expenses = (data.expenses || []).map(x => ({
-    ...x,
-    qty: Number(x.qty),
-    unit_cost: Number(x.unit_cost),
-    total: Number(x.total)
-  })).sort((a, b) => (a.date < b.date ? 1 : -1));
-  state.expensePayments = (data.expensePayments || []).map(p => ({
-    ...p,
-    amount: Number(p.amount)
-  }));
-}
-
-function expenseTotals(expenseId) {
-  const paid = state.expensePayments
-    .filter(p => p.expense_id === expenseId)
-    .reduce((s, p) => s + Number(p.amount || 0), 0);
-  return { paid };
-}
-
-function totalsFor(empNum) {
-  const earned = state.entries.filter(e => e.employee_number === empNum)
-    .reduce((s, e) => s + Number(e.amount_earned), 0);
-  const gasAccrued = state.entries.filter(e => e.employee_number === empNum)
-    .reduce((s, e) => s + Number(e.gasolina || 0), 0);
-
-  const myPayments = state.payments.filter(p => p.employee_number === empNum);
-  const wagesPaid = myPayments.reduce((s, p) => s + paymentWages(p), 0);
-  const gasPaid = myPayments.reduce((s, p) => s + paymentGas(p), 0);
-
-  return {
-    earned, gasAccrued, wagesPaid, gasPaid,
-    wagesBalance: earned - wagesPaid,
-    gasBalance: gasAccrued - gasPaid
-  };
-}
-
-// Reads a payment row's wages/gas split. Supports both the current
-// one-row format (wages_amount / gas_amount) and older rows saved
-// with a single "type" + "amount" field, so past data keeps working.
-function paymentWages(p) {
-  if (p.wages_amount !== undefined && p.wages_amount !== '') return Number(p.wages_amount) || 0;
-  return (p.type !== 'Gas') ? (Number(p.amount) || 0) : 0;
-}
-function paymentGas(p) {
-  if (p.gas_amount !== undefined && p.gas_amount !== '') return Number(p.gas_amount) || 0;
-  return (p.type === 'Gas') ? (Number(p.amount) || 0) : 0;
-}
-
-function hourlyRate(emp) {
-  if (!emp.standard_hours) return 0;
-  return emp.daily_rate / emp.standard_hours;
-}
-
-// Pay for a day's hours, capped at the employee's agreed daily rate once
-// they hit their standard hours -- working past that doesn't earn more,
-// it just tops out at the flat daily amount (e.g. Julio: $350 for 9h+).
-function amountForHours(hours, emp) {
-  const raw = Math.round(hours * hourlyRate(emp) * 100) / 100;
-  const cap = Number(emp.daily_rate) || raw;
-  return Math.min(raw, cap);
-}
-
-/* ============================================================
-   Local cache -- lets the app paint instantly from the last known
-   data while it quietly re-fetches from the (slower) Apps Script
-   backend in the background. Only affects what's shown while
-   waiting; never used instead of a real save.
-   ============================================================ */
-const CACHE_KEY = 'crew_app_cache_v1';
-
-function loadCache() {
-  try {
-    const raw = localStorage.getItem(CACHE_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch (e) { return null; }
-}
-function saveCache() {
-  try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify({
-      employees: state.employees, entries: state.entries,
-      payments: state.payments, expenses: state.expenses
-    }));
-  } catch (e) { /* storage full or unavailable -- fine, just skip caching */ }
-}
-
-/* ============================================================
-   Render
-   ============================================================ */
-function paintCurrentView() {
-  const app = document.getElementById('app');
-  if (state.view === 'home') return renderHome(app);
-  if (state.view === 'worker') return renderWorker(app);
-  if (state.view === 'adminGate') return renderAdminGate(app);
-  if (state.view === 'admin') return renderAdmin(app);
-}
-
-async function render() {
-  const app = document.getElementById('app');
-
-  if (!state.configured) {
-    app.innerHTML = `
-      <main style="padding-top:60px">
-        <div class="card">
-          <h2>One setup step left</h2>
-          <p style="color:var(--ink-soft); font-size:14px; line-height:1.5;">
-            Open this file and fill in <b>GAS_URL</b> near the top
-            with your Apps Script Web App URL (ends in <code>/exec</code>),
-            then reload this page.
-          </p>
-        </div>
-      </main>`;
-    return;
-  }
-
-  const hadDataAlready = state.employees.length > 0 || state.entries.length > 0;
-  if (!hadDataAlready) {
-    app.innerHTML = `
-      <main style="padding-top:60px; text-align:center; color:var(--ink-soft); font-size:14px;">
-        Carregando dados&hellip;
-      </main>`;
-  }
-
-  try {
-    await loadAll();
-    saveCache();
-  } catch (err) {
-    if (hadDataAlready) {
-      // We already have something on screen (from cache or a prior load) --
-      // keep showing it rather than replacing a working view with an error.
-      showToast("N\u00e3o foi poss\u00edvel atualizar \u2014 mostrando os \u00faltimos dados salvos", true);
-      return paintCurrentView();
-    }
-    app.innerHTML = `
-      <main style="padding-top:60px">
-        <div class="card">
-          <h2>N\u00e3o foi poss\u00edvel conectar</h2>
-          <p style="color:var(--ink-soft); font-size:14px;">${err.message}</p>
-          <button class="secondary" onclick="render()">Tentar novamente</button>
-        </div>
-      </main>`;
-    return;
-  }
-
-  return paintCurrentView();
-}
-
-function renderHome(app) {
-  const tiles = state.employees.map(emp => `
-    <button class="tile" style="--tile-color:${COLORS[emp.color] || COLORS.Gray}"
-      onclick="openWorker(${emp.employee_number})">
-      <div class="name">${escapeHtml(emp.name)}</div>
-      <div class="rate">${money(hourlyRate(emp))}/hora</div>
-    </button>
-  `).join('');
-
-  app.innerHTML = `
-    <header class="top">
-      <h1>Ponto da Equipe</h1>
-      <div class="sub">Toque no seu nome para registrar suas horas</div>
-    </header>
-    <main>
-      <div class="grid">
-        ${tiles || ''}
-      </div>
-      ${state.employees.length === 0 ? `<div class="empty">Nenhum funcion\u00e1rio ainda. Adicione pelo Admin.</div>` : ''}
-      <div class="admin-link" onclick="goAdminGate()">Admin</div>
-    </main>
-  `;
-}
-
-function openWorker(empNum) {
-  if (blockedBySavePending()) return;
-  state.activeEmployee = empNum;
-  state.view = 'worker';
-  paintCurrentView();
-}
-
-function renderWorker(app) {
-  const emp = state.employees.find(e => e.employee_number === state.activeEmployee);
-  if (!emp) { state.view = 'home'; return renderHome(app); }
-  // Unpaid days only: uses the same oldest-day-first payment matching as the
-  // Admin Payments tab / Custom Report, so both screens always agree on which
-  // days are paid. A shift that's still open always shows. Newest first, max 6.
-  const isOpenEntry = e => (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null);
-  const recent = computePaymentAllocation(emp.employee_number)
-    .filter(a => isOpenEntry(a) || a.status !== 'Paid')
-    .sort((a, b) => (a.work_date < b.work_date ? 1 : a.work_date > b.work_date ? -1 : Number(b.start_time) - Number(a.start_time)))
-    .slice(0, 6);
-
-  const openEntry = state.entries.find(e =>
-    e.employee_number === emp.employee_number && e.id &&
-    (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null)
-  );
-  const todayDone = state.entries.find(e =>
-    e.employee_number === emp.employee_number && e.work_date === todayStr() &&
-    e.finish_time !== '' && e.finish_time !== undefined && e.finish_time !== null
-  );
-
-  app.innerHTML = `
-    <header class="top">
-      <button class="back" onclick="goHome()">&larr; Toda a equipe</button>
-      <h1 style="margin-top:6px">${escapeHtml(emp.name)}</h1>
-      <div class="sub">${money(hourlyRate(emp))} / hora</div>
-    </header>
-    <main>
-      ${todayDone && !openEntry ? `
-      <div class="card" style="background:#EAF7EE; border-color:var(--good);">
-        <div style="color:var(--good); font-weight:700; font-size:15px;">\u2713 Hoje j\u00e1 registrado</div>
-        <div style="font-size:14px; color:var(--ink-soft); margin-top:4px;">${formatDecimalTime(todayDone.start_time)}&ndash;${formatDecimalTime(todayDone.finish_time)} &middot; ${todayDone.hours_worked}h &middot; ${money(todayDone.amount_earned)}</div>
-      </div>
-      ` : ''}
-
-      ${openEntry ? `
-      <div class="card">
-        <h2>Voc\u00ea est\u00e1 com o ponto aberto</h2>
-        <div style="font-size:14px; color:var(--ink-soft); margin-bottom:10px;">Desde ${formatDecimalTime(openEntry.start_time)} em ${fmtDate(openEntry.work_date)}</div>
-        ${openEntry.work_date !== todayStr() ? `<div style="font-size:13px; color:var(--bad); margin-bottom:10px;">Isso foi outro dia \u2014 informe o hor\u00e1rio real que voc\u00ea saiu, n\u00e3o agora.</div>` : ''}
-        <label>Hor\u00e1rio de sa\u00edda (24h)</label>
-        ${timePickerHTML('co_finish', openEntry.work_date === todayStr() ? currentTimeDecimal() : null)}
-        <div style="font-size:12px; color:var(--ink-soft); margin: 4px 0 12px;">Preenchido com a hora atual \u2014 mude se n\u00e3o estiver certo.</div>
-        <button class="primary" onclick="clockOut(this, '${openEntry.id}', ${emp.employee_number})">Bater Ponto de Sa\u00edda</button>
-      </div>
-      ` : `
-      <div class="card">
-        <h2>Pronto para come\u00e7ar?</h2>
-        <div style="font-size:13.5px; color:var(--ink-soft); margin-bottom:10px;">Registrando para hoje: <b>${fmtDate(todayStr())}</b></div>
-        <label>Hor\u00e1rio de in\u00edcio (24h)</label>
-        ${timePickerHTML('ci_start', currentTimeDecimal())}
-        <div style="font-size:12px; color:var(--ink-soft); margin: 4px 0 12px;">Preenchido com a hora atual \u2014 mude se n\u00e3o estiver certo.</div>
-        <button class="primary" onclick="clockIn(this, ${emp.employee_number})">Bater Ponto de Entrada</button>
-      </div>
-      `}
-
-      <div class="admin-link" onclick="toggleManualEntry()" style="margin-top:2px;">Esqueceu um dia inteiro? Registrar manualmente</div>
-      <div class="card" id="manualEntryCard" style="display:none;">
-        <h2>Registrar um dia passado</h2>
-        <div style="font-size:12px; color:var(--ink-soft); margin-bottom:10px;">Escolha a data e informe os dois hor\u00e1rios \u2014 use isso se esqueceu de bater o ponto naquele dia.</div>
-        <label>Data</label>
-        <input type="date" id="f_date" value="${todayStr()}">
-        <div class="two-col">
-          <div>
-            <label>Hor\u00e1rio de in\u00edcio (24h)</label>
-            ${timePickerHTML('f_start', 7)}
-          </div>
-          <div>
-            <label>Hor\u00e1rio de sa\u00edda (24h)</label>
-            ${timePickerHTML('f_finish', 17)}
-          </div>
-        </div>
-        <div style="font-size:12px; color:var(--ink-soft); margin-top:-4px;">O almo\u00e7o (1h) \u00e9 descontado automaticamente.</div>
-        <label>Observa\u00e7\u00f5es (opcional)</label>
-        <input type="text" id="f_notes" placeholder="Obra, tarefa, etc.">
-        <button class="primary" onclick="submitEntry(this, ${emp.employee_number})">Salvar horas</button>
-      </div>
-
-      <div class="card">
-        <h2>Dias ainda n\u00e3o pagos</h2>
-        ${recent.length ? recent.map(e => `
-          <div class="entry">
-            <div>
-              <div>${fmtDate(e.work_date)}</div>
-              <div class="d">${
-                (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null)
-                  ? `Iniciado \u00e0s ${formatDecimalTime(e.start_time)} \u2014 ainda trabalhando`
-                  : (Number(e.hours_worked) > 0 ? `${formatDecimalTime(e.start_time)}&ndash;${formatDecimalTime(e.finish_time)} &middot; ${e.hours_worked}h` : (e.notes || 'Pagamento por servi\u00e7o'))
-              }</div>
-            </div>
-            <div class="amt" style="text-align:right;">${isOpenEntry(e) ? '' : (e.status === 'Partial' ? `${money(e.owedAmt)}<div class="d" style="font-weight:400;">falta (pago em parte)</div>` : money(e.amount_earned))}</div>
-          </div>
-        `).join('') : `<div class="empty">Tudo pago \u2014 nenhum dia pendente</div>`}
-      </div>
-    </main>
-  `;
-}
-
-function toggleManualEntry() {
-  const el = document.getElementById('manualEntryCard');
-  if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
-}
-
-// Finds an existing entry for this employee/date whose time range overlaps
-// the proposed new one. Pass newFinish as null for a Clock In (finish not
-// known yet) -- then it just checks whether newStart falls inside an
-// existing range. An entry with no finish_time (still open) is treated as
-// running until end of day for this check.
-function findOverlappingEntry(empNum, date, newStart, newFinish) {
-  const sameDay = state.entries.filter(e => e.employee_number === empNum && e.work_date === date);
-  for (const e of sameDay) {
-    const eStart = Number(e.start_time);
-    const eEnd = (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null) ? 24 : Number(e.finish_time);
-    if (newFinish === null || newFinish === undefined) {
-      if (newStart >= eStart && newStart < eEnd) return e;
+    if (action === 'addEntry') {
+      var entry = body.entry;
+      // Lock so two taps arriving at the same moment can't both slip through.
+      var lock = LockService.getScriptLock();
+      lock.waitLock(20000);
+      try {
+        var dup = findDuplicateEntry_(entry);
+        if (dup) {
+          // Same shift already saved (repeat tap, or a retry after weak signal) --
+          // don't add another row, just hand back the one that's already there.
+          if (dup.sameShift) return jsonOut({ ok: true, id: dup.row.id, duplicate: true });
+          return jsonOut({ error: 'J\u00e1 existe um registro nesse hor\u00e1rio para esse dia.' });
+        }
+        entry.id = Utilities.getUuid();  // lets a later clock-out (or edit) find this exact row
+        appendRow('TimeEntries', entry);
+        SpreadsheetApp.flush();
+      } finally {
+        lock.releaseLock();
+      }
+      if (entry.finish_time === '') {
+        notifyClockEvent_('in', entry.employee_number, entry.start_time, entry.work_date);
+      }
+      return jsonOut({ ok: true, id: entry.id });
+    } else if (action === 'updateEntry') {
+      updateRowByKey('TimeEntries', 'id', body.id, body.patch);
+      if (body.patch && body.patch.finish_time !== undefined) {
+        var entries = sheetToObjects('TimeEntries');
+        var match = null;
+        for (var j = 0; j < entries.length; j++) { if (entries[j].id === body.id) { match = entries[j]; break; } }
+        if (match) notifyClockEvent_('out', match.employee_number, body.patch.finish_time, match.work_date);
+      }
+    } else if (action === 'addEmployee') {
+      appendRow('Employees', body.employee);
+    } else if (action === 'updateEmployee') {
+      if (body.patch && body.patch.active !== undefined) ensureColumn_('Employees', 'active');
+      updateRowByKey('Employees', 'employee_number', body.employee_number, body.patch);
+    } else if (action === 'addPayment') {
+      appendRow('Payments', body.payment);
+    } else if (action === 'addExpense') {
+      var expense = body.expense;
+      expense.id = Utilities.getUuid();  // stable id so a receipt can be attached later
+      if (expense.receipt_data) {
+        try {
+          expense.receipt_url = saveReceiptToDrive(expense.receipt_data, expense.receipt_type, expense.receipt_name);
+        } catch (err) {
+          expense.receipt_url = '';  // don't fail the whole expense save just because the upload hiccuped
+        }
+      }
+      appendRow('Expenses', expense);
+      return jsonOut({ ok: true, id: expense.id });
+    } else if (action === 'attachReceipt') {
+      var receiptUrl = saveReceiptToDrive(body.receipt_data, body.receipt_type, body.receipt_name);
+      updateRowByKey('Expenses', 'id', body.id, { receipt_url: receiptUrl });
+    } else if (action === 'updateExpense') {
+      updateRowByKey('Expenses', 'id', body.id, body.patch);
+    } else if (action === 'addExpensePayment') {
+      appendRow('ExpensePayments', body.payment);
+    } else if (action === 'deleteEntry') {
+      var delLock = LockService.getScriptLock();
+      delLock.waitLock(20000);
+      try { deleteRowByKey_('TimeEntries', 'id', body.id, 'deleted in Admin'); }
+      finally { delLock.releaseLock(); }
     } else {
-      if (newStart < eEnd && eStart < newFinish) return e;
+      return jsonOut({ error: 'Unknown action: ' + action });
+    }
+    return jsonOut({ ok: true });
+  } catch (err) {
+    return jsonOut({ error: err.message });
+  }
+}
+
+/* ---------------- helpers ---------------- */
+
+// Adds a header column to a sheet if it isn't there yet (used for the
+// Employees "active" column, so it never has to be typed in by hand).
+function ensureColumn_(name, header) {
+  var sheet = getSheet_(name);
+  var lastCol = sheet.getLastColumn();
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  if (headers.indexOf(header) === -1) sheet.getRange(1, lastCol + 1).setValue(header);
+}
+
+/**
+ * Auto-cleanup of duplicate time entries (e.g. the same Clock In saved
+ * several times because of weak signal). Only touches rows the app created
+ * (they have an id) and only removes true repeats -- same employee, same day,
+ * same start time:
+ *   - extra OPEN copies are removed (if one copy was already clocked out,
+ *     every open copy goes; otherwise the first open one is kept)
+ *   - CLOSED copies are removed only if finish time and amount also match
+ * Entries that overlap but have different times are NOT touched -- the app
+ * can't know which one is right, so Admin shows a warning for those instead.
+ * Nothing is lost: every removed row is copied to a "RemovedEntries" tab.
+ */
+function cleanDuplicateEntries_() {
+  var sheet = getSheet_('TimeEntries');
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 3) return 0;
+  var headers = values[0];
+  var cId = headers.indexOf('id'), cEmp = headers.indexOf('employee_number'),
+      cDate = headers.indexOf('work_date'), cStart = headers.indexOf('start_time'),
+      cFinish = headers.indexOf('finish_time'), cAmt = headers.indexOf('amount_earned');
+  if ([cId, cEmp, cDate, cStart, cFinish].indexOf(-1) > -1) return 0;
+  var isBlank = function (v) { return v === '' || v === null || v === undefined; };
+
+  var groups = {};
+  for (var r = 1; r < values.length; r++) {
+    var row = values[r];
+    if (isBlank(row[cId])) continue;  // hand-added / imported rows are never touched
+    var start = normalizeCell('start_time', row[cStart]);
+    if (isBlank(start) || isNaN(Number(start))) continue;
+    var key = String(row[cEmp]) + '|' + normalizeCell('work_date', row[cDate]) + '|' + Number(start).toFixed(2);
+    (groups[key] = groups[key] || []).push(r);
+  }
+
+  var toRemove = [];
+  Object.keys(groups).forEach(function (key) {
+    var rows = groups[key];
+    if (rows.length < 2) return;
+    var hasClosed = rows.some(function (r) { return !isBlank(values[r][cFinish]); });
+    var keptOpen = false, keptClosed = [];
+    rows.forEach(function (r) {
+      var fin = values[r][cFinish];
+      if (isBlank(fin)) {
+        if (hasClosed || keptOpen) toRemove.push(r); else keptOpen = true;
+      } else {
+        var sig = Number(normalizeCell('finish_time', fin)).toFixed(2) + '|' +
+                  (cAmt > -1 ? Number(values[r][cAmt] || 0).toFixed(2) : '');
+        if (keptClosed.indexOf(sig) > -1) toRemove.push(r); else keptClosed.push(sig);
+      }
+    });
+  });
+
+  if (!toRemove.length) return 0;
+  archiveRows_(headers, toRemove.map(function (r) { return values[r]; }), 'auto: duplicate');
+  toRemove.sort(function (a, b) { return b - a; })  // bottom-up so row numbers don't shift
+    .forEach(function (r) { sheet.deleteRow(r + 1); });
+  return toRemove.length;
+}
+
+function deleteRowByKey_(name, keyField, keyValue, reason) {
+  var sheet = getSheet_(name);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0];
+  var keyCol = headers.indexOf(keyField);
+  if (keyCol === -1) throw new Error('Column not found: ' + keyField);
+  for (var r = 1; r < values.length; r++) {
+    if (String(values[r][keyCol]) === String(keyValue)) {
+      archiveRows_(headers, [values[r]], reason);
+      sheet.deleteRow(r + 1);
+      return;
+    }
+  }
+  throw new Error('No row found where ' + keyField + ' = ' + keyValue);
+}
+
+// Copies removed rows into a "RemovedEntries" tab (created automatically the
+// first time) so anything cleaned up can always be checked or restored.
+function archiveRows_(headers, rows, reason) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('RemovedEntries');
+  if (!sheet) {
+    sheet = ss.insertSheet('RemovedEntries');
+    sheet.appendRow(['removed_at', 'reason'].concat(headers));
+  }
+  var stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+  rows.forEach(function (row) { sheet.appendRow([stamp, reason].concat(row)); });
+}
+
+/**
+ * Server-side duplicate guard for new time entries. Returns null if the new
+ * entry is fine to save, otherwise { row, sameShift }:
+ *   sameShift = true  -> it's a repeat of something already saved (e.g. a
+ *                        second Clock In while a shift is still open, or the
+ *                        exact same manual entry again) -- safe to ignore.
+ *   sameShift = false -> it overlaps a different existing shift that day.
+ */
+function findDuplicateEntry_(entry) {
+  var rows = sheetToObjects('TimeEntries');
+  var isOpen = function (v) { return v === '' || v === null || v === undefined; };
+  var newOpen = isOpen(entry.finish_time);
+  var newStart = Number(entry.start_time);
+  var newEnd = newOpen ? 24 : Number(entry.finish_time);
+
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (String(r.employee_number) !== String(entry.employee_number)) continue;
+    var rOpen = isOpen(r.finish_time);
+
+    // Clocking in while this person already has an open shift = a repeat tap.
+    if (newOpen && rOpen) return { row: r, sameShift: true };
+
+    if (String(r.work_date) !== String(entry.work_date)) continue;
+    var rStart = Number(r.start_time);
+    var rEnd = rOpen ? 24 : Number(r.finish_time);
+    if (newStart < rEnd && rStart < newEnd) {
+      var identical = !newOpen && !rOpen && rStart === newStart && rEnd === newEnd;
+      return { row: r, sameShift: identical };
     }
   }
   return null;
 }
 
-function describeEntry(e) {
-  return e.finish_time
-    ? `${formatDecimalTime(e.start_time)}\u2013${formatDecimalTime(e.finish_time)} (${e.hours_worked}h, ${money(e.amount_earned)})`
-    : `iniciado \u00e0s ${formatDecimalTime(e.start_time)}, ainda em aberto`;
+function getSheet_(name) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!sheet) throw new Error('Sheet not found: ' + name);
+  return sheet;
 }
 
-// Updates the screen right away after a successful save (adds the new entry,
-// or merges changes into an existing one), instead of leaving the old screen
-// up while the slow full refresh from Google runs in the background.
-function applyLocalEntry(entry) {
-  const i = state.entries.findIndex(e => e.id === entry.id);
-  if (i > -1) state.entries[i] = { ...state.entries[i], ...entry };
-  else state.entries.unshift(entry);
-  saveCache();
-  paintCurrentView();
+function sheetToObjects(name) {
+  var sheet = getSheet_(name);
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+  var headers = values[0];
+  return values.slice(1)
+    .filter(function (row) { return row.some(function (c) { return c !== '' && c !== null; }); })
+    .map(function (row) {
+      var obj = {};
+      headers.forEach(function (h, i) { obj[h] = normalizeCell(h, row[i]); });
+      return obj;
+    });
 }
 
-// A save can reach the sheet even when the phone never hears back (weak
-// signal). So on any failure, re-check the real data instead of assuming it
-// didn't save -- if it did, the screen catches up; if not, it's safe to retry
-// (the backend ignores repeat clock-ins).
-function saveFailed(err) {
-  const network = err instanceof TypeError || (err && err.name === 'SyntaxError');
-  showToast(network ? 'Sem sinal? Verificando se foi salvo\u2026' : err.message, true);
-  render();
-}
-
-async function clockIn(btn, empNum) {
-  const emp = state.employees.find(e => e.employee_number === empNum);
-  const startTime = readTimePicker('ci_start');
-  if (isNaN(startTime)) { showToast('Informe o hor\u00e1rio de in\u00edcio', true); return; }
-
-  const conflict = findOverlappingEntry(empNum, todayStr(), startTime, null);
-  if (conflict) {
-    alert(`J\u00e1 existe um registro nesse hor\u00e1rio para hoje: ${describeEntry(conflict)}.\n\nEscolha outro hor\u00e1rio para registrar este dia.`);
-    return;
+/**
+ * Safety net: if a "date" or "time" column ever gets auto-converted by
+ * Sheets into a real Date object (e.g. Plain Text formatting was missed
+ * before typing), rebuild it into the plain string/number the app
+ * expects, instead of letting a raw Date leak out as garbled JSON.
+ */
+function normalizeCell(header, value) {
+  if (!(value instanceof Date)) return value;
+  var h = header.toLowerCase();
+  var isDateField = h.indexOf('date') > -1 || h === 'covers_from' || h === 'covers_to';
+  if (isDateField) {
+    return Utilities.formatDate(value, 'Etc/GMT', 'yyyy-MM-dd');
   }
+  // start_time / finish_time got auto-converted to a time-of-day value -- rebuild as a decimal hour (7, 17.5, ...)
+  var hh = Number(Utilities.formatDate(value, 'Etc/GMT', 'H'));
+  var mm = Number(Utilities.formatDate(value, 'Etc/GMT', 'm'));
+  return Math.round((hh + mm / 60) * 100) / 100;
+}
 
-  await guardedSave(btn, 'Salvando\u2026', async () => {
-    try {
-      const result = await gasPost('addEntry', {
-        entry: {
-          employee_number: empNum, work_date: todayStr(), start_time: startTime, finish_time: '',
-          hours_worked: '', hourly_rate: hourlyRate(emp), amount_earned: '', gasolina: 0, notes: ''
-        }
+function appendRow(name, obj) {
+  var sheet = getSheet_(name);
+  var headers = sheet.getDataRange().getValues()[0];
+  var row = headers.map(function (h) { return (obj[h] !== undefined ? obj[h] : ''); });
+  sheet.appendRow(row);
+}
+
+function updateRowByKey(name, keyField, keyValue, patch) {
+  var sheet = getSheet_(name);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0];
+  var keyCol = headers.indexOf(keyField);
+  if (keyCol === -1) throw new Error('Column not found: ' + keyField);
+
+  for (var r = 1; r < values.length; r++) {
+    if (String(values[r][keyCol]) === String(keyValue)) {
+      Object.keys(patch).forEach(function (field) {
+        var col = headers.indexOf(field);
+        if (col > -1) sheet.getRange(r + 1, col + 1).setValue(patch[field]);
       });
-      showToast(result.duplicate
-        ? 'Voc\u00ea j\u00e1 tinha batido o ponto \u2014 nada foi duplicado'
-        : `Ponto de entrada \u00e0s ${formatDecimalTime(startTime)}`);
-      if (result.id) applyLocalEntry({
-        id: result.id, employee_number: empNum, work_date: todayStr(), start_time: startTime, finish_time: '',
-        hours_worked: 0, hourly_rate: hourlyRate(emp), amount_earned: 0, gasolina: 0, notes: ''
-      });
-      render();
-    } catch (err) { saveFailed(err); }
-  });
-}
-
-async function clockOut(btn, id, empNum) {
-  const emp = state.employees.find(e => e.employee_number === empNum);
-  const openEntry = state.entries.find(e => e.id === id);
-  if (!openEntry) { showToast('N\u00e3o foi poss\u00edvel encontrar esse ponto de entrada', true); return; }
-  const finishTime = readTimePicker('co_finish');
-  if (isNaN(finishTime)) { showToast('Informe o hor\u00e1rio de sa\u00edda', true); return; }
-  const hours = hoursBetween(openEntry.start_time, finishTime);
-  const rate = hourlyRate(emp);
-  const amount = amountForHours(hours, emp);
-  await guardedSave(btn, 'Salvando\u2026', async () => {
-    try {
-      await gasPost('updateEntry', { id, patch: { finish_time: finishTime, hours_worked: hours, amount_earned: amount } });
-      showToast(`Ponto de sa\u00edda: ${hours}h, ${money(amount)}`);
-      applyLocalEntry({ id, finish_time: finishTime, hours_worked: hours, amount_earned: amount });
-      render();
-    } catch (err) { saveFailed(err); }
-  });
-}
-
-async function submitEntry(btn, empNum) {
-  const emp = state.employees.find(e => e.employee_number === empNum);
-  const date = document.getElementById('f_date').value;
-  const notes = document.getElementById('f_notes').value || '';
-  const start = readTimePicker('f_start');
-  const finish = readTimePicker('f_finish');
-
-  if (!date || isNaN(start) || isNaN(finish)) { showToast('Preencha data, hor\u00e1rio de in\u00edcio e sa\u00edda', true); return; }
-
-  const conflict = findOverlappingEntry(empNum, date, start, finish);
-  if (conflict) {
-    alert(`J\u00e1 existe um registro nesse hor\u00e1rio em ${fmtDate(date)}: ${describeEntry(conflict)}.\n\nEscolha outro hor\u00e1rio para registrar este dia.`);
-    return;
-  }
-
-  const hours = hoursBetween(start, finish);
-  const rate = hourlyRate(emp);
-  const amount = amountForHours(hours, emp);
-
-  await guardedSave(btn, 'Salvando\u2026', async () => {
-    try {
-      const result = await gasPost('addEntry', {
-        entry: {
-          employee_number: empNum, work_date: date, start_time: start, finish_time: finish,
-          hours_worked: hours, hourly_rate: rate, amount_earned: amount, gasolina: 0, notes
-        }
-      });
-      showToast(result.duplicate ? 'Esse dia j\u00e1 estava salvo \u2014 nada foi duplicado' : `Salvo: ${hours}h, ${money(amount)}`);
-      if (result.id) applyLocalEntry({
-        id: result.id, employee_number: empNum, work_date: date, start_time: start, finish_time: finish,
-        hours_worked: hours, hourly_rate: rate, amount_earned: amount, gasolina: 0, notes
-      });
-      render();
-    } catch (err) { saveFailed(err); }
-  });
-}
-
-function goHome() { if (blockedBySavePending()) return; state.view = 'home'; paintCurrentView(); }
-function goAdminGate() { if (blockedBySavePending()) return; state.view = 'adminGate'; paintCurrentView(); }
-
-function renderAdminGate(app) {
-  app.innerHTML = `
-    <header class="top">
-      <button class="back" onclick="goHome()">&larr; Back</button>
-      <h1 style="margin-top:6px">Admin</h1>
-    </header>
-    <main>
-      <div class="pin-box">
-        <div style="color:var(--ink-soft); font-size:14px;">Enter PIN</div>
-        <input type="password" id="pin" inputmode="numeric" maxlength="8" autofocus>
-        <button class="primary" style="width:160px" onclick="checkPin()">Enter</button>
-      </div>
-    </main>
-  `;
-}
-function checkPin() {
-  if (blockedBySavePending()) return;
-  const val = document.getElementById('pin').value;
-  if (val === ADMIN_PIN) { state.view = 'admin'; paintCurrentView(); }
-  else showToast('Wrong PIN', true);
-}
-
-function renderAdmin(app) {
-  app.innerHTML = `
-    <header class="top">
-      <button class="back" onclick="goHome()">&larr; Exit admin</button>
-      <h1 style="margin-top:6px">Admin</h1>
-      <div class="admin-link" onclick="render()" style="color:#BFD0DA; margin-top:4px;">\u21bb Refresh data</div>
-    </header>
-    <main>
-      ${renderOverlapWarning()}
-      <div class="tabs">
-        <div class="tab ${state.adminTab === 'employees' ? 'active' : ''}" onclick="setAdminTab('employees')">Employees</div>
-        <div class="tab ${state.adminTab === 'payments' ? 'active' : ''}" onclick="setAdminTab('payments')">Payments</div>
-        <div class="tab ${state.adminTab === 'expenses' ? 'active' : ''}" onclick="setAdminTab('expenses')">Expenses</div>
-        <div class="tab ${state.adminTab === 'summary' ? 'active' : ''}" onclick="setAdminTab('summary')">Summary</div>
-      </div>
-      <div id="adminBody"></div>
-    </main>
-  `;
-  const body = document.getElementById('adminBody');
-  if (state.adminTab === 'employees') return renderAdminEmployees(body);
-  if (state.adminTab === 'payments') return renderAdminPayments(body);
-  if (state.adminTab === 'expenses') return renderAdminExpenses(body);
-  if (state.adminTab === 'summary') return renderAdminSummary(body);
-}
-// Finds pairs of entries for the same employee on the same day whose times
-// overlap. Exact duplicates are already removed automatically by the backend,
-// so anything left here is a real conflict that needs a person to decide.
-function findOverlapPairs() {
-  const isOpen = e => (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null);
-  const timed = state.entries.filter(e => e.start_time !== '' && e.start_time !== null && e.start_time !== undefined && !isNaN(Number(e.start_time)));
-  const pairs = [];
-  for (let i = 0; i < timed.length; i++) {
-    for (let j = i + 1; j < timed.length; j++) {
-      const a = timed[i], b = timed[j];
-      if (a.employee_number !== b.employee_number || a.work_date !== b.work_date) continue;
-      const aEnd = isOpen(a) ? 24 : Number(a.finish_time), bEnd = isOpen(b) ? 24 : Number(b.finish_time);
-      if (Number(a.start_time) < bEnd && Number(b.start_time) < aEnd) pairs.push([a, b]);
+      return;
     }
   }
-  return pairs;
+  throw new Error('No row found where ' + keyField + ' = ' + keyValue);
 }
 
-function renderOverlapWarning() {
-  const pairs = findOverlapPairs();
-  if (!pairs.length) return '';
-  const line = e => {
-    const open = (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null);
-    const txt = open
-      ? `${formatDecimalTime(e.start_time)} \u2013 still clocked in`
-      : `${formatDecimalTime(e.start_time)}\u2013${formatDecimalTime(e.finish_time)} &middot; ${e.hours_worked}h &middot; ${money(e.amount_earned)}`;
-    return `<div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0;">
-      <span style="font-size:13px;">${txt}</span>
-      ${e.id ? `<button class="small danger" onclick="deleteEntry(this, '${e.id}')">Delete</button>` : `<span class="d">edit in sheet</span>`}
-    </div>`;
-  };
-  return `
-    <div class="card no-print" style="border-color:var(--bad); background:#FDF0EE;">
-      <h2 style="color:var(--bad);">\u26a0 Overlapping hours</h2>
-      <div style="font-size:12.5px; color:var(--ink-soft); margin-bottom:8px;">These entries cover the same time on the same day. Delete the wrong one so pay isn't counted twice.</div>
-      ${pairs.map(([a, b]) => {
-        const emp = state.employees.find(x => x.employee_number === a.employee_number);
-        return `<div style="border-top:1px solid var(--line); padding-top:8px; margin-top:8px;">
-          <div style="font-weight:700; font-size:14px;">${emp ? escapeHtml(emp.name) : 'Employee ' + a.employee_number} &middot; ${fmtDate(a.work_date)}</div>
-          ${line(a)}${line(b)}
-        </div>`;
-      }).join('')}
-    </div>`;
+/**
+ * Saves a receipt (photo or PDF) sent from the app into a "Crew Time and
+ * Pay Receipts" folder in your Google Drive, makes it link-viewable, and
+ * returns that link. Only the link is stored in the Expenses sheet --
+ * the actual file data never touches the spreadsheet.
+ */
+function saveReceiptToDrive(dataUrl, mimeType, fileName) {
+  var base64 = dataUrl.indexOf(',') > -1 ? dataUrl.split(',')[1] : dataUrl;
+  var bytes = Utilities.base64Decode(base64);
+  var blob = Utilities.newBlob(bytes, mimeType || 'application/octet-stream', fileName || ('receipt_' + new Date().getTime()));
+  var folder = getOrCreateFolder_('Crew Time and Pay Receipts');
+  var file = folder.createFile(blob);
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return file.getUrl();
 }
 
-async function deleteEntry(btn, id) {
-  const e = state.entries.find(x => x.id === id);
-  if (!e) return;
-  if (!confirm(`Delete this entry (${fmtDate(e.work_date)}, starting ${formatDecimalTime(e.start_time)})?\n\nA copy is kept in the RemovedEntries tab of the sheet.`)) return;
-  await guardedSave(btn, 'Deleting\u2026', async () => {
-    try {
-      await gasPost('deleteEntry', { id });
-      state.entries = state.entries.filter(x => x.id !== id);
-      saveCache();
-      paintCurrentView();
-      showToast('Entry deleted');
-      render();
-    } catch (err) { showToast(err.message, true); render(); }
-  });
+function getOrCreateFolder_(name) {
+  var folders = DriveApp.getFoldersByName(name);
+  if (folders.hasNext()) return folders.next();
+  return DriveApp.createFolder(name);
 }
 
-function setAdminTab(tab) { if (blockedBySavePending()) return; state.adminTab = tab; paintCurrentView(); }
+/**
+ * Emails a clock in/out notification. Set NOTIFY_EMAIL below to a specific
+ * address, or leave it blank to notify the script owner's own account.
+ */
+var NOTIFY_EMAIL = 'gvvini.carvalho@gmail.com';  // e.g. 'you@gmail.com' -- blank uses your own Google account automatically
 
-function renderAdminEmployees(body) {
-  const colorOptions = Object.keys(COLORS).map(c => `<option value="${c}">${c}</option>`).join('');
-  body.innerHTML = `
-    <div class="card">
-      <h2>Employees</h2>
-      ${state.employees.map(emp => `
-        <div class="emp-row">
-          <div class="swatch" style="background:${COLORS[emp.color] || COLORS.Gray}"></div>
-          <div class="fields">
-            <input value="${escapeHtml(emp.name)}" onchange="updateEmployee(${emp.employee_number}, {name:this.value})">
-            <input type="number" value="${emp.daily_rate}" onchange="updateEmployee(${emp.employee_number}, {daily_rate:parseFloat(this.value)||0})">
-            <input type="number" value="${emp.standard_hours}" onchange="updateEmployee(${emp.employee_number}, {standard_hours:parseFloat(this.value)||1})">
-            <select onchange="updateEmployee(${emp.employee_number}, {color:this.value})">
-              ${Object.keys(COLORS).map(c => `<option value="${c}" ${c===emp.color?'selected':''}>${c}</option>`).join('')}
-            </select>
-          </div>
-        </div>
-      `).join('') || `<div class="empty">No employees yet</div>`}
-      <div style="display:flex; gap:8px; font-size:11px; color:var(--ink-soft); margin-top:6px;">
-        <div style="flex:1.4">Name</div><div style="flex:0.8">Daily rate</div><div style="flex:0.8">Std hrs</div><div style="flex:0.9">Color</div>
-      </div>
-      <button class="secondary" onclick="addEmployee()">+ Add employee</button>
-    </div>
-  `;
-}
-
-async function updateEmployee(empNum, patch) {
+function notifyClockEvent_(action, employeeNumber, decimalTime, workDate) {
   try {
-    await gasPost('updateEmployee', { employee_number: empNum, patch });
-    showToast('Updated');
-    render();
-  } catch (err) { showToast(err.message, true); }
-}
-
-async function addEmployee() {
-  const next = state.employees.length ? Math.max(...state.employees.map(e => e.employee_number)) + 1 : 1;
-  const name = prompt('Employee name?');
-  if (!name) return;
-  try {
-    await gasPost('addEmployee', {
-      employee: { employee_number: next, name, daily_rate: 100, standard_hours: 10, color: 'Gray' }
-    });
-    showToast('Employee added');
-    render();
-  } catch (err) { showToast(err.message, true); }
-}
-
-function renderAdminPayments(body) {
-  const defaults = state.paymentFormDefaults || {};
-  const empDefault = (defaults.empNum !== undefined) ? defaults.empNum
-    : (state.employees[0] ? state.employees[0].employee_number : undefined);
-  // "From" always starts on this employee's first unpaid day (or today if all paid).
-  const fromDefault = firstUnpaidDate(empDefault) || todayStr();
-  const toDefault = todayStr();
-
-  body.innerHTML = `
-    <div class="card">
-      <h2>Record a payment</h2>
-      <label>Employee</label>
-      <select id="p_emp" onchange="onPaymentEmployeeChange()">
-        ${state.employees.map(e => `<option value="${e.employee_number}" ${empDefault === e.employee_number ? 'selected' : ''}>${escapeHtml(e.name)}</option>`).join('')}
-      </select>
-      <label>Covers days from</label>
-      <div class="two-col">
-        <div>
-          <input type="date" id="p_from" value="${fromDefault}" onchange="recalcPaymentRange()">
-        </div>
-        <div>
-          <input type="date" id="p_to" value="${toDefault}" onchange="recalcPaymentRange()">
-        </div>
-      </div>
-      <div id="p_breakdown" style="font-size:12.5px; color:var(--ink-soft); margin-top:8px;"></div>
-
-      <label>Payment date</label>
-      <input type="date" id="p_date" value="${todayStr()}">
-
-      <label>Wages amount</label>
-      <input type="number" id="p_wages" inputmode="decimal" step="0.01" placeholder="0.00" oninput="updatePaymentTotal()">
-      <label>Gas amount</label>
-      <input type="number" id="p_gas" inputmode="decimal" step="0.01" placeholder="0.00" oninput="updatePaymentTotal()">
-      <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Both auto-filled from the range above \u2014 adjust either before saving.</div>
-
-      <div class="stat-row" style="margin-top:14px;">
-        <div class="stat" style="flex:1"><div class="num" id="p_total">$0.00</div><div class="lbl">Total to pay</div></div>
-      </div>
-
-      <button class="primary" onclick="submitPayment(this)">Save payment</button>
-    </div>
-    <div class="card">
-      <h2>Recent payments</h2>
-      ${state.payments.slice(0, 15).map(p => {
-        const emp = state.employees.find(e => e.employee_number === p.employee_number);
-        const w = paymentWages(p), g = paymentGas(p);
-        const breakdown = (w && g) ? `${money(w)} wages + ${money(g)} gas` : (g ? `${money(g)} gas` : `${money(w)} wages`);
-        return `<div class="entry">
-          <div><div>${emp ? escapeHtml(emp.name) : 'Unknown'}</div><div class="d">${fmtDate(p.payment_date)} &middot; ${breakdown}${p.covers_from ? ` &middot; covers ${fmtDate(p.covers_from)}\u2013${fmtDate(p.covers_to)}` : ''}</div></div>
-          <div class="amt">${money(w + g)}</div>
-        </div>`;
-      }).join('') || `<div class="empty">No payments yet</div>`}
-    </div>
-  `;
-  recalcPaymentRange();
-}
-
-// Oldest day this employee still has money owed on (same matching as the
-// Custom Report), or null if everything is paid.
-function firstUnpaidDate(empNum) {
-  if (empNum === undefined || empNum === null) return null;
-  const first = computePaymentAllocation(empNum).find(a => a.owedAmt > 0.005);
-  return first ? first.work_date : null;
-}
-
-function onPaymentEmployeeChange() {
-  const empNum = parseInt(document.getElementById('p_emp').value, 10);
-  document.getElementById('p_from').value = firstUnpaidDate(empNum) || todayStr();
-  recalcPaymentRange();
-}
-
-function recalcPaymentRange() {
-  const empNum = parseInt(document.getElementById('p_emp').value, 10);
-  const from = document.getElementById('p_from').value;
-  const to = document.getElementById('p_to').value;
-  const breakdownEl = document.getElementById('p_breakdown');
-  if (!from || !to) return;
-
-  const inRange = computePaymentAllocation(empNum).filter(e =>
-    e.work_date >= from && e.work_date <= to
-  );
-
-  // Suggest only what's still owed, so a partly-paid first day isn't paid twice.
-  const wagesTotal = inRange.reduce((s, e) => s + e.owedAmt, 0);
-  document.getElementById('p_wages').value = wagesTotal ? (Math.round(wagesTotal * 100) / 100) : '';
-  // Gas amount is entered manually by you (e.g. a flat weekly $70) -- not auto-calculated,
-  // since gas is no longer tied to any specific day's hours.
-
-  if (!inRange.length) {
-    breakdownEl.innerHTML = 'No logged entries in this range for this employee.';
-  } else {
-    breakdownEl.innerHTML = 'Days included: ' + inRange.map(e => {
-      const label = Number(e.hours_worked) > 0 ? fmtDate(e.work_date) : `${fmtDate(e.work_date)} \u2013 ${escapeHtml(e.notes || 'job')}`;
-      if (e.finish_time === '' || e.finish_time === undefined || e.finish_time === null) return `${label} (still clocked in)`;
-      if (e.status === 'Paid') return `${label} (already paid)`;
-      if (e.status === 'Partial') return `${label} (${money(e.owedAmt)} left of ${money(e.amount_earned)})`;
-      return `${label} (${money(e.amount_earned)})`;
-    }).join(', ');
-  }
-  updatePaymentTotal();
-}
-
-function updatePaymentTotal() {
-  const wages = parseFloat(document.getElementById('p_wages').value) || 0;
-  const gas = parseFloat(document.getElementById('p_gas').value) || 0;
-  document.getElementById('p_total').textContent = money(wages + gas);
-}
-
-async function submitPayment(btn) {
-  const empNum = parseInt(document.getElementById('p_emp').value, 10);
-  const from = document.getElementById('p_from').value;
-  const to = document.getElementById('p_to').value;
-  const date = document.getElementById('p_date').value;
-  const wages = parseFloat(document.getElementById('p_wages').value) || 0;
-  const gas = parseFloat(document.getElementById('p_gas').value) || 0;
-
-  if (!date || (!wages && !gas)) { showToast('Fill in a date and at least one amount', true); return; }
-
-  await guardedSave(btn, 'Saving\u2026', async () => {
-    try {
-      await gasPost('addPayment', {
-        payment: {
-          employee_number: empNum, payment_date: date,
-          wages_amount: wages, gas_amount: gas,
-          covers_from: from, covers_to: to
-        }
-      });
-      showToast(`Saved: ${money(wages + gas)} total`);
-      state.paymentFormDefaults = { empNum };
-      render();
-    } catch (err) { showToast(err.message, true); }
-  });
-}
-
-function addOneDay(dateStr) {
-  const d = new Date(dateStr + 'T00:00:00');
-  d.setDate(d.getDate() + 1);
-  return d.toISOString().slice(0, 10);
-}
-
-function renderAdminExpenses(body) {
-  const categories = ['Material', 'Labor', 'Contractor', 'Other'];
-  const statuses = ['Paid', 'Unpaid', 'Partial'];
-  body.innerHTML = `
-    <div class="card">
-      <h2>Log a project expense</h2>
-      <label>Date</label>
-      <input type="date" id="x_date" value="${todayStr()}">
-      <label>Category</label>
-      <select id="x_category">
-        ${categories.map(c => `<option value="${c}">${c}</option>`).join('')}
-      </select>
-      <label>Description</label>
-      <input type="text" id="x_desc" placeholder="What was it for?">
-      <label>Vendor / Worker</label>
-      <input type="text" id="x_vendor" placeholder="Who you paid">
-      <div class="two-col">
-        <div>
-          <label>Qty</label>
-          <input type="number" id="x_qty" value="1" step="0.01">
-        </div>
-        <div>
-          <label>Unit cost</label>
-          <input type="number" id="x_unit" inputmode="decimal" step="0.01" placeholder="0.00">
-        </div>
-      </div>
-      <label>Payment status</label>
-      <select id="x_status" onchange="toggleDownpayment()">
-        ${statuses.map(s => `<option value="${s}">${s}</option>`).join('')}
-      </select>
-      <div id="downpaymentWrap" style="display:none; margin-top:10px; padding:10px; background:#F7F5F0; border-radius:8px;">
-        <label style="margin-top:0;">Down payment now (optional)</label>
-        <div class="two-col">
-          <div>
-            <input type="date" id="x_downdate" value="${todayStr()}">
-          </div>
-          <div>
-            <input type="number" id="x_downamt" inputmode="decimal" step="0.01" placeholder="0.00">
-          </div>
-        </div>
-        <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Records this as the first payment right away \u2014 leave blank to add it later instead.</div>
-      </div>
-      <label>Notes (optional)</label>
-      <input type="text" id="x_notes" placeholder="Anything extra">
-      <label>Receipt photo (optional)</label>
-      <input type="file" id="x_receipt" accept="image/*,application/pdf" capture="environment">
-      <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Take a photo or pick one from your library. It's saved to your Google Drive and linked to this expense.</div>
-      <button class="primary" onclick="submitExpense(this)">Save expense</button>
-    </div>
-    <div class="card">
-      <h2>Recent expenses</h2>
-      ${(() => {
-        const withOwing = state.expenses.map(x => {
-          const paid = x.id ? expenseTotals(x.id).paid : 0;
-          const owes = (x.payment_status !== 'Paid' || paid > 0.005) && (x.total - paid) > 0.005;
-          return { x, owes };
-        });
-        const owingItems = withOwing.filter(o => o.owes).map(o => o.x)
-          .sort((a, b) => (a.date < b.date ? 1 : -1));
-        const settledItems = withOwing.filter(o => !o.owes).map(o => o.x)
-          .sort((a, b) => (a.date < b.date ? 1 : -1))
-          .slice(0, 20 - owingItems.length > 0 ? 20 - owingItems.length : 5);
-        return [...owingItems, ...settledItems];
-      })().map(x => {
-        const paidSoFar = x.id ? expenseTotals(x.id).paid : 0;
-        const needsTracking = x.payment_status !== 'Paid' || paidSoFar > 0.005;
-        const t = { paid: needsTracking ? paidSoFar : x.total };
-        const balance = x.total - t.paid;
-        return `
-        <div class="entry">
-          <div>
-            <div>${escapeHtml(x.description || x.category)}</div>
-            <div class="d">${fmtDate(x.date)} &middot; ${x.category} &middot; ${escapeHtml(x.vendor || '')}</div>
-            ${needsTracking ? `<div class="d" style="margin-top:2px;">Paid ${money(t.paid)} of ${money(x.total)} &middot; <b>${money(balance)} owed</b></div>` : ''}
-            <div style="margin-top:4px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-              ${x.receipt_url
-                ? `<a href="${x.receipt_url}" target="_blank" rel="noopener" style="color:var(--steel); font-weight:600; font-size:12.5px;">View receipt</a>`
-                : (x.id
-                    ? `<input type="file" accept="image/*,application/pdf" capture="environment" style="display:none" id="receipt_${x.id}" onchange="attachReceiptToExpense('${x.id}', this.files[0])">
-                       <button class="small" onclick="document.getElementById('receipt_${x.id}').click()">+ Receipt</button>`
-                    : `<span style="font-size:11.5px; color:var(--ink-soft);">No receipt (older entry)</span>`)
-              }
-              ${needsTracking && x.id && balance > 0 ? `<button class="small" onclick="togglePayExpense('${x.id}')">+ Payment</button>` : ''}
-            </div>
-            ${x.id ? `
-            <div id="payform_${x.id}" style="display:none; margin-top:8px; padding:10px; background:#F7F5F0; border-radius:8px;">
-              <input type="date" id="pay_date_${x.id}" value="${todayStr()}" style="margin-bottom:6px;">
-              <input type="number" id="pay_amt_${x.id}" inputmode="decimal" step="0.01" placeholder="Amount" value="${balance ? (Math.round(balance*100)/100) : ''}" style="margin-bottom:6px;">
-              <button class="small" onclick="submitExpensePayment(this, '${x.id}')">Save payment</button>
-            </div>` : ''}
-          </div>
-          <div class="amt">${money(x.total)}</div>
-        </div>
-      `; }).join('') || `<div class="empty">No expenses logged yet</div>`}
-    </div>
-  `;
-}
-
-function toggleDownpayment() {
-  const status = document.getElementById('x_status').value;
-  const wrap = document.getElementById('downpaymentWrap');
-  if (wrap) wrap.style.display = status === 'Partial' ? 'block' : 'none';
-}
-
-async function submitExpense(btn) {
-  const date = document.getElementById('x_date').value;
-  const category = document.getElementById('x_category').value;
-  const description = document.getElementById('x_desc').value;
-  const vendor = document.getElementById('x_vendor').value;
-  const qty = parseFloat(document.getElementById('x_qty').value) || 0;
-  const unit_cost = parseFloat(document.getElementById('x_unit').value) || 0;
-  const payment_status = document.getElementById('x_status').value;
-  const notes = document.getElementById('x_notes').value || '';
-  const receiptFile = document.getElementById('x_receipt').files[0];
-  const downDate = document.getElementById('x_downdate') ? document.getElementById('x_downdate').value : '';
-  const downAmt = document.getElementById('x_downamt') ? (parseFloat(document.getElementById('x_downamt').value) || 0) : 0;
-
-  if (!date || !description || !unit_cost) { showToast('Fill in date, description and unit cost', true); return; }
-
-  // Payment date is derived, not asked for separately: same day as the expense
-  // if marked Paid, the down-payment date if Partial, or blank if Unpaid.
-  const payment_date = payment_status === 'Paid' ? date : (payment_status === 'Partial' && downAmt > 0 ? downDate : '');
-
-  const total = Math.round(qty * unit_cost * 100) / 100;
-  const expense = { date, category, description, vendor, qty, unit_cost, total, payment_status, payment_date, notes };
-
-  await guardedSave(btn, 'Saving\u2026', async () => {
-    try {
-      if (receiptFile) {
-        if (receiptFile.size > 15 * 1024 * 1024) { showToast('Receipt file is too large (max 15MB)', true); return; }
-        showToast('Uploading receipt\u2026');
-        expense.receipt_name = receiptFile.name;
-        expense.receipt_type = receiptFile.type || 'application/octet-stream';
-        expense.receipt_data = receiptFile.type.startsWith('image/')
-          ? await compressImageToDataURL(receiptFile, 1400, 0.72)
-          : await fileToDataURL(receiptFile);
-      }
-      const result = await gasPost('addExpense', { expense });
-      if (payment_status === 'Partial' && downAmt > 0 && result && result.id) {
-        await gasPost('addExpensePayment', { payment: { expense_id: result.id, payment_date: downDate || todayStr(), amount: downAmt } });
-        if (downAmt >= total - 0.005) {
-          try { await gasPost('updateExpense', { id: result.id, patch: { payment_status: 'Paid' } }); } catch (err) { /* non-critical */ }
-        }
-      }
-      showToast(downAmt > 0 ? `Saved: ${money(total)} (down payment ${money(downAmt)} recorded)` : `Saved: ${money(total)}`);
-      render();
-    } catch (err) { showToast(err.message, true); }
-  });
-}
-
-async function attachReceiptToExpense(id, file) {
-  if (!file) return;
-  if (file.size > 15 * 1024 * 1024) { showToast('Receipt file is too large (max 15MB)', true); return; }
-  try {
-    showToast('Uploading receipt\u2026');
-    const receipt_data = file.type.startsWith('image/')
-      ? await compressImageToDataURL(file, 1400, 0.72)
-      : await fileToDataURL(file);
-    await gasPost('attachReceipt', { id, receipt_data, receipt_type: file.type || 'application/octet-stream', receipt_name: file.name });
-    showToast('Receipt attached');
-    render();
-  } catch (err) { showToast(err.message, true); }
-}
-
-function togglePayExpense(id) {
-  const el = document.getElementById(`payform_${id}`);
-  if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
-}
-
-async function submitExpensePayment(btn, id) {
-  const date = document.getElementById(`pay_date_${id}`).value;
-  const amount = parseFloat(document.getElementById(`pay_amt_${id}`).value) || 0;
-  if (!date || !amount) { showToast('Fill in a date and amount', true); return; }
-  await guardedSave(btn, 'Saving\u2026', async () => {
-    try {
-      await gasPost('addExpensePayment', { payment: { expense_id: id, payment_date: date, amount } });
-      const newTotalPaid = expenseTotals(id).paid + amount;  // state's paid-so-far, plus this payment
-      await maybeMarkExpensePaid(id, newTotalPaid);
-      showToast(`Payment saved: ${money(amount)}`);
-      render();
-    } catch (err) { showToast(err.message, true); }
-  });
-}
-
-// Once an expense's payments add up to its full total, flip its status to
-// Paid automatically -- so it stops showing as "owed" and matches reality.
-async function maybeMarkExpensePaid(id, totalPaidSoFar) {
-  const exp = state.expenses.find(x => x.id === id);
-  if (exp && exp.payment_status !== 'Paid' && totalPaidSoFar >= exp.total - 0.005) {
-    try { await gasPost('updateExpense', { id, patch: { payment_status: 'Paid' } }); } catch (err) { /* non-critical -- ignore */ }
+    var to = NOTIFY_EMAIL || Session.getEffectiveUser().getEmail();
+    var name = getEmployeeName_(employeeNumber);
+    var timeLabel = formatDecimalTimeForEmail_(decimalTime);
+    var actionLabel = (action === 'in') ? 'Clocked IN' : 'Clocked OUT';
+    var subject = actionLabel + ': ' + name + ' (' + timeLabel + ')';
+    var body = name + ' ' + actionLabel + ' at ' + timeLabel + ' on ' + workDate + '.';
+    MailApp.sendEmail(to, subject, body);
+  } catch (err) {
+    // Never let a failed email break the actual clock in/out save.
   }
 }
 
-function fileToDataURL(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = e => resolve(e.target.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-// Shrinks a photo before upload so it goes through the (slow) Apps Script
-// backend quickly instead of sending a multi-megabyte camera image as-is.
-function compressImageToDataURL(file, maxDim, quality) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = e => {
-      const img = new Image();
-      img.onload = () => {
-        let { width, height } = img;
-        if (width > maxDim || height > maxDim) {
-          if (width > height) { height = Math.round(height * maxDim / width); width = maxDim; }
-          else { width = Math.round(width * maxDim / height); height = maxDim; }
-        }
-        const canvas = document.createElement('canvas');
-        canvas.width = width; canvas.height = height;
-        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', quality));
-      };
-      img.onerror = reject;
-      img.src = e.target.result;
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-function generateCustomReport() {
-  const empVal = document.getElementById('cr_emp').value;
-  const from = document.getElementById('cr_from').value;
-  const to = document.getElementById('cr_to').value;
-  if (!from || !to) { showToast('Pick a from and to date', true); return; }
-  state.customReport = { empNum: empVal === 'all' ? 'all' : parseInt(empVal, 10), from, to };
-  render();
-}
-
-function clearCustomReport() {
-  state.customReport = null;
-  render();
-}
-
-// Allocates an employee's total wages paid (all-time) against their earnings
-// oldest-day-first, so we can tell exactly which specific days are still
-// unpaid -- not just a lump "total owed" figure.
-function computePaymentAllocation(empNum) {
-  const entries = state.entries.filter(e => e.employee_number === empNum)
-    .slice().sort((a, b) => (a.work_date < b.work_date ? -1 : 1));
-  let pool = state.payments.filter(p => p.employee_number === empNum)
-    .reduce((s, p) => s + paymentWages(p), 0);
-
-  return entries.map(e => {
-    const amt = Number(e.amount_earned) || 0;
-    let status, paidAmt, owedAmt;
-    if (pool >= amt - 0.005) { status = 'Paid'; paidAmt = amt; owedAmt = 0; pool -= amt; }
-    else if (pool > 0.005) { status = 'Partial'; paidAmt = pool; owedAmt = amt - pool; pool = 0; }
-    else { status = 'Unpaid'; paidAmt = 0; owedAmt = amt; }
-    return { ...e, status, paidAmt, owedAmt };
-  });
-}
-
-function renderCustomReportSection(cr) {
-  const inRange = e => e.work_date >= cr.from && e.work_date <= cr.to;
-  const rangeLabel = `${fmtDate(cr.from)} \u2013 ${fmtDate(cr.to)}`;
-
-  if (cr.empNum === 'all') {
-    const rows = state.employees.map(emp => {
-      const entries = state.entries.filter(e => e.employee_number === emp.employee_number && inRange(e));
-      const hours = entries.reduce((s, e) => s + Number(e.hours_worked || 0), 0);
-      const earned = entries.reduce((s, e) => s + Number(e.amount_earned || 0), 0);
-      return `<tr><td>${escapeHtml(emp.name)}</td><td>${hours}</td><td>${money(earned)}</td></tr>`;
-    }).join('');
-    return `
-      <div class="card" style="overflow-x:auto">
-        <h2>Custom Report: All Employees</h2>
-        <div style="font-size:12.5px; color:var(--ink-soft); margin-bottom:8px;">${rangeLabel}</div>
-        <table class="summary">
-          <thead><tr><th>Name</th><th>Hours</th><th>Earned</th></tr></thead>
-          <tbody>${rows || `<tr><td colspan="3" class="empty">No employees</td></tr>`}</tbody>
-        </table>
-      </div>`;
+function getEmployeeName_(employeeNumber) {
+  var employees = sheetToObjects('Employees');
+  for (var i = 0; i < employees.length; i++) {
+    if (String(employees[i].employee_number) === String(employeeNumber)) return employees[i].name;
   }
-
-  const emp = state.employees.find(e => e.employee_number === cr.empNum);
-  if (!emp) return '';
-
-  const allocation = computePaymentAllocation(cr.empNum);
-  const inRangeAlloc = allocation.filter(a => inRange(a));
-  const hoursTotal = inRangeAlloc.reduce((s, a) => s + Number(a.hours_worked || 0), 0);
-  const earnedTotal = inRangeAlloc.reduce((s, a) => s + Number(a.amount_earned || 0), 0);
-  const stillOwedTotal = inRangeAlloc.reduce((s, a) => s + a.owedAmt, 0);
-  const paymentsInRange = state.payments.filter(p => p.employee_number === cr.empNum && p.payment_date >= cr.from && p.payment_date <= cr.to);
-  const wagesPaidInRange = paymentsInRange.reduce((s, p) => s + paymentWages(p), 0);
-  const gasPaidInRange = paymentsInRange.reduce((s, p) => s + paymentGas(p), 0);
-
-  const statusColor = { Paid: 'var(--good)', Partial: '#B8860B', Unpaid: 'var(--bad)' };
-  const entryRows = inRangeAlloc.map(a => `
-    <tr style="${a.status !== 'Paid' ? 'background:#FFF6E9;' : ''}">
-      <td>${fmtDate(a.work_date)}</td>
-      <td>${Number(a.hours_worked) > 0 ? a.hours_worked : (a.notes || 'Job')}</td>
-      <td>${money(a.amount_earned)}</td>
-      <td style="color:${statusColor[a.status]}; font-weight:700;">${a.status}</td>
-      <td>${a.owedAmt > 0 ? money(a.owedAmt) : '\u2014'}</td>
-    </tr>`).join('');
-
-  return `
-    <div class="card" style="overflow-x:auto">
-      <h2>Custom Report: ${escapeHtml(emp.name)}</h2>
-      <div style="font-size:12.5px; color:var(--ink-soft); margin-bottom:8px;">${rangeLabel}</div>
-      <table class="summary">
-        <thead><tr><th>Date</th><th>Hours</th><th>Earned</th><th>Status</th><th>Still owed</th></tr></thead>
-        <tbody>${entryRows || `<tr><td colspan="5" class="empty">No entries in this range</td></tr>`}</tbody>
-      </table>
-      <div class="entry" style="border-top:2px solid var(--ink); margin-top:8px; padding-top:10px;">
-        <div><b>Total hours / earned this range</b></div><div class="amt">${hoursTotal} hrs &middot; ${money(earnedTotal)}</div>
-      </div>
-      <div class="entry"><div>Wages paid in this range</div><div class="amt">${money(wagesPaidInRange)}</div></div>
-      <div class="entry"><div>Gas paid in this range</div><div class="amt">${money(gasPaidInRange)}</div></div>
-      <div class="entry" style="border-top:2px solid var(--bad); margin-top:6px; padding-top:10px;">
-        <div><b>Still owed for days in this range</b></div><div class="amt" style="color:var(--bad); font-size:17px;">${money(stillOwedTotal)}</div>
-      </div>
-    </div>`;
+  return 'Employee ' + employeeNumber;
 }
 
-function renderAdminSummary(body) {
-  const rows = state.employees.map(emp => {
-    const t = totalsFor(emp.employee_number);
-    return `<tr>
-      <td>${escapeHtml(emp.name)}</td>
-      <td>${money(t.earned)}</td>
-      <td>${money(t.wagesPaid)}</td>
-      <td><b>${money(t.wagesBalance)}</b></td>
-      <td>${money(t.gasAccrued)}</td>
-      <td>${money(t.gasPaid)}</td>
-      <td><b>${money(t.gasBalance)}</b></td>
-    </tr>`;
-  }).join('');
-
-  const wagesTotal = state.employees.reduce((s, e) => s + totalsFor(e.employee_number).earned, 0);
-  const gasTotal = state.employees.reduce((s, e) => s + totalsFor(e.employee_number).gasAccrued, 0);
-
-  const categories = ['Material', 'Labor', 'Contractor', 'Other'];
-  const catRows = categories.map(cat => {
-    const total = state.expenses.filter(x => x.category === cat).reduce((s, x) => s + Number(x.total || 0), 0);
-    return `<tr><td>${cat}</td><td>${money(total)}</td></tr>`;
-  }).join('');
-  const expensesTotal = state.expenses.reduce((s, x) => s + Number(x.total || 0), 0);
-  const grandTotal = expensesTotal + wagesTotal + gasTotal;
-
-  const now = new Date();
-  const generatedOn = `${now.getMonth() + 1}/${now.getDate()}/${now.getFullYear()}`;
-  const cr = state.customReport;
-  const crFromDefault = cr ? cr.from : (() => { const d = new Date(); d.setDate(d.getDate() - 6); return d.toISOString().slice(0, 10); })();
-  const crToDefault = cr ? cr.to : todayStr();
-  const crEmpDefault = cr ? cr.empNum : 'all';
-
-  body.innerHTML = `
-    <button class="secondary no-print" onclick="window.print()" style="margin-bottom:16px;">Print Report</button>
-
-    <div class="card no-print">
-      <h2>Custom Report</h2>
-      <div style="font-size:12.5px; color:var(--ink-soft); margin-bottom:10px;">See wages/hours for one employee (or everyone) over a specific week or date range.</div>
-      <label>Employee</label>
-      <select id="cr_emp">
-        <option value="all" ${crEmpDefault === 'all' ? 'selected' : ''}>All Employees</option>
-        ${state.employees.map(e => `<option value="${e.employee_number}" ${crEmpDefault === e.employee_number ? 'selected' : ''}>${escapeHtml(e.name)}</option>`).join('')}
-      </select>
-      <div class="two-col">
-        <div>
-          <label>From</label>
-          <input type="date" id="cr_from" value="${crFromDefault}">
-        </div>
-        <div>
-          <label>To</label>
-          <input type="date" id="cr_to" value="${crToDefault}">
-        </div>
-      </div>
-      <button class="primary" onclick="generateCustomReport()">Generate Report</button>
-      ${cr ? `<button class="secondary" onclick="clearCustomReport()">Clear</button>` : ''}
-    </div>
-
-    <div id="printable-report">
-      <div class="print-only" style="display:none; margin-bottom:20px;">
-        <h1 style="font-size:22px; margin-bottom:4px;">Construction Project Report</h1>
-        <div style="color:#555; font-size:13px;">Generated ${generatedOn}</div>
-      </div>
-
-      ${cr ? renderCustomReportSection(cr) : ''}
-
-      <div class="card" style="overflow-x:auto">
-      <h2>All employees</h2>
-      <table class="summary">
-        <thead><tr><th>Name</th><th>Earned</th><th>Wages paid</th><th>Wages owed</th><th>Gas accrued</th><th>Gas paid</th><th>Gas owed</th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="7" class="empty">No employees yet</td></tr>`}</tbody>
-      </table>
-    </div>
-
-    <div class="card" style="overflow-x:auto">
-      <h2>Expenses by category</h2>
-      <table class="summary">
-        <thead><tr><th>Category</th><th>Total</th></tr></thead>
-        <tbody>${catRows}<tr><td><b>Expense Log total</b></td><td><b>${money(expensesTotal)}</b></td></tr></tbody>
-      </table>
-    </div>
-
-    <div class="card">
-      <h2>Total project cost</h2>
-      <div class="entry"><div>Expense Log (materials, contractors, other)</div><div class="amt">${money(expensesTotal)}</div></div>
-      <div class="entry"><div>Employee wages</div><div class="amt">${money(wagesTotal)}</div></div>
-      <div class="entry"><div>Employee gas / gasolina</div><div class="amt">${money(gasTotal)}</div></div>
-      <div class="entry" style="border-top:2px solid var(--ink); margin-top:4px; padding-top:12px;">
-        <div><b>GRAND TOTAL</b></div><div class="amt" style="font-size:18px;">${money(grandTotal)}</div>
-      </div>
-    </div>
-    </div>
-  `;
+function formatDecimalTimeForEmail_(dec) {
+  var h = Math.floor(Number(dec));
+  var m = Math.round((Number(dec) - h) * 60);
+  return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
 }
 
-/* ============================================================
-   Utils
-   ============================================================ */
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function jsonOut(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
 }
-function fmtDate(iso) {
-  if (typeof iso !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(iso)) return iso;
-  const [y, m, d] = iso.slice(0, 10).split('-');
-  return `${m}/${d}/${y.slice(2)}`;
-}
-
-const cached = loadCache();
-if (cached) {
-  state.employees = cached.employees || [];
-  state.entries = cached.entries || [];
-  state.payments = cached.payments || [];
-  state.expenses = cached.expenses || [];
-  paintCurrentView();  // instant paint from last known data while render() refreshes in the background
-}
-render();
-
-// If the app was left open (phone locked, tab backgrounded, etc.) and the
-// person comes back to it, quietly pull fresh data -- no button needed.
-// render() already shows the existing view while it fetches in the
-// background, so this doesn't cause any jarring "loading" flash.
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && !savePending) {
-    render();
-  }
-});
-</script>
-</body>
-</html>
