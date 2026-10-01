@@ -999,13 +999,12 @@ function findHoursToFix() {
   const fixes = [];
   state.employees.forEach(emp => {
     computePaymentAllocation(emp.employee_number).forEach(a => {
-      if (a.status === 'Paid') return;
       const open = (a.finish_time === '' || a.finish_time === undefined || a.finish_time === null);
       if (open || a.start_time === '' || a.start_time === null || a.start_time === undefined) return;
       if (isNaN(Number(a.start_time)) || isNaN(Number(a.finish_time))) return;
       const newHours = hoursBetween(a.start_time, a.finish_time);
       if (Math.abs(newHours - Number(a.hours_worked || 0)) < 0.005) return;
-      fixes.push({ entry: a, emp, newHours, newAmount: amountForHours(newHours, emp) });
+      fixes.push({ entry: a, emp, newHours, newAmount: amountForHours(newHours, emp), wasPaid: a.status !== 'Unpaid' });
     });
   });
   return fixes.sort((x, y) => (x.entry.work_date < y.entry.work_date ? -1 : 1));
@@ -1017,13 +1016,13 @@ function renderHoursFixCard() {
   const canFix = fixes.filter(f => f.entry.id);
   return `
     <div class="card no-print" style="border-color:#B8860B; background:#FFF8E6;">
-      <h2>Recalculate unpaid days</h2>
-      <div style="font-size:12.5px; color:var(--ink-soft); margin-bottom:8px;">These unpaid days were saved under the old lunch rule. With lunch only subtracted when the shift covers 12:00\u201313:00, they change to:</div>
+      <h2>Recalculate hours (lunch rule)</h2>
+      <div style="font-size:12.5px; color:var(--ink-soft); margin-bottom:8px;">These days were saved under the old \u201calways subtract 1h lunch\u201d rule. With lunch only subtracted when the shift covers 12:00\u201313:00, they change as shown. For days you already paid, the difference is added to what you owe, so it shows up in the next payment.</div>
       ${fixes.map(f => `
         <div class="entry">
           <div>
             <div>${escapeHtml(f.emp.name)} &middot; ${fmtDate(f.entry.work_date)}</div>
-            <div class="d">${formatDecimalTime(f.entry.start_time)}\u2013${formatDecimalTime(f.entry.finish_time)} &middot; ${f.entry.hours_worked}h \u2192 <b>${f.newHours}h</b>${f.entry.id ? '' : ' &middot; edit in sheet (older row)'}</div>
+            <div class="d">${formatDecimalTime(f.entry.start_time)}\u2013${formatDecimalTime(f.entry.finish_time)} &middot; ${f.entry.hours_worked}h \u2192 <b>${f.newHours}h</b>${f.wasPaid ? ' &middot; <span style="color:#B8860B; font-weight:600;">already paid: +' + money(f.newAmount - Number(f.entry.amount_earned || 0)) + ' to pay</span>' : ''}${f.entry.id ? '' : ' &middot; <b>edit in sheet (older row)</b>'}</div>
           </div>
           <div class="amt">${money(f.entry.amount_earned)} \u2192 ${money(f.newAmount)}</div>
         </div>`).join('')}
