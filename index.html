@@ -268,11 +268,17 @@ function blockedBySavePending() {
   return false;
 }
 
+const LUNCH_START = 12, LUNCH_END = 13;
+
 function hoursBetween(startHrs, finishHrs) {
   let diff = Number(finishHrs) - Number(startHrs);
   diff = ((diff % 24) + 24) % 24;
-  diff = Math.max(diff - 1, 0);  // 1-hour lunch deduction, same as the Excel formula
-  return Math.round(diff * 100) / 100;
+  // 1-hour lunch is only subtracted when the shift covers the whole lunch
+  // window (12:00-13:00). A short morning or afternoon shift keeps every hour.
+  const start = Number(startHrs);
+  const end = start + diff;  // can go past 24 for a shift that crosses midnight
+  if (start <= LUNCH_START && end >= LUNCH_END) diff -= 1;
+  return Math.round(Math.max(diff, 0) * 100) / 100;
 }
 
 function currentTimeDecimal() {
@@ -634,7 +640,7 @@ function renderWorker(app) {
             ${timePickerHTML('f_finish', 17)}
           </div>
         </div>
-        <div style="font-size:12px; color:var(--ink-soft); margin-top:-4px;">O almo\u00e7o (1h) \u00e9 descontado automaticamente.</div>
+        <div style="font-size:12px; color:var(--ink-soft); margin-top:-4px;">O almo\u00e7o (1h) s\u00f3 \u00e9 descontado se o turno cobre 12:00\u201313:00.</div>
         <label>Observa\u00e7\u00f5es (opcional)</label>
         <input type="text" id="f_notes" placeholder="Obra, tarefa, etc.">
         <button class="primary" onclick="submitEntry(this, ${emp.employee_number})">Salvar horas</button>
@@ -972,6 +978,67 @@ async function addEmployee() {
   } catch (err) { showToast(err.message, true); }
 }
 
+// Unpaid, finished entries whose saved hours don't match the current lunch
+// rule (e.g. saved under the old "always subtract 1h" rule). Paid days are
+// left alone so nothing already settled changes.
+function findHoursToFix() {
+  const fixes = [];
+  state.employees.forEach(emp => {
+    computePaymentAllocation(emp.employee_number).forEach(a => {
+      if (a.status === 'Paid') return;
+      const open = (a.finish_time === '' || a.finish_time === undefined || a.finish_time === null);
+      if (open || a.start_time === '' || a.start_time === null || a.start_time === undefined) return;
+      if (isNaN(Number(a.start_time)) || isNaN(Number(a.finish_time))) return;
+      const newHours = hoursBetween(a.start_time, a.finish_time);
+      if (Math.abs(newHours - Number(a.hours_worked || 0)) < 0.005) return;
+      fixes.push({ entry: a, emp, newHours, newAmount: amountForHours(newHours, emp) });
+    });
+  });
+  return fixes.sort((x, y) => (x.entry.work_date < y.entry.work_date ? -1 : 1));
+}
+
+function renderHoursFixCard() {
+  const fixes = findHoursToFix();
+  if (!fixes.length) return '';
+  const canFix = fixes.filter(f => f.entry.id);
+  return `
+    <div class="card no-print" style="border-color:#B8860B; background:#FFF8E6;">
+      <h2>Recalculate unpaid days</h2>
+      <div style="font-size:12.5px; color:var(--ink-soft); margin-bottom:8px;">These unpaid days were saved under the old lunch rule. With lunch only subtracted when the shift covers 12:00\u201313:00, they change to:</div>
+      ${fixes.map(f => `
+        <div class="entry">
+          <div>
+            <div>${escapeHtml(f.emp.name)} &middot; ${fmtDate(f.entry.work_date)}</div>
+            <div class="d">${formatDecimalTime(f.entry.start_time)}\u2013${formatDecimalTime(f.entry.finish_time)} &middot; ${f.entry.hours_worked}h \u2192 <b>${f.newHours}h</b>${f.entry.id ? '' : ' &middot; edit in sheet (older row)'}</div>
+          </div>
+          <div class="amt">${money(f.entry.amount_earned)} \u2192 ${money(f.newAmount)}</div>
+        </div>`).join('')}
+      ${canFix.length ? `<button class="primary" onclick="applyHoursFixes(this)">Update ${canFix.length} day${canFix.length > 1 ? 's' : ''}</button>` : ''}
+    </div>`;
+}
+
+async function applyHoursFixes(btn) {
+  const fixes = findHoursToFix().filter(f => f.entry.id);
+  if (!fixes.length) return;
+  await guardedSave(btn, 'Updating\u2026', async () => {
+    let done = 0;
+    try {
+      for (const f of fixes) {
+        await gasPost('updateEntry', { id: f.entry.id, patch: { hours_worked: f.newHours, amount_earned: f.newAmount } });
+        const local = state.entries.find(e => e.id === f.entry.id);
+        if (local) { local.hours_worked = f.newHours; local.amount_earned = f.newAmount; }
+        done++;
+      }
+      showToast(`Updated ${done} day${done > 1 ? 's' : ''}`);
+    } catch (err) {
+      showToast(`Updated ${done}, then failed: ${err.message}`, true);
+    }
+    saveCache();
+    paintCurrentView();
+    render();
+  });
+}
+
 function renderAdminPayments(body) {
   const defaults = state.paymentFormDefaults || {};
   const empDefault = (defaults.empNum !== undefined) ? defaults.empNum
@@ -981,6 +1048,7 @@ function renderAdminPayments(body) {
   const toDefault = todayStr();
 
   body.innerHTML = `
+    ${renderHoursFixCard()}
     <div class="card">
       <h2>Record a payment</h2>
       <label>Employee</label>
