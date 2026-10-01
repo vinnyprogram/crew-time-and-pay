@@ -535,6 +535,20 @@ function isActiveEmployee(emp) {
   return String(emp.active || '').trim().toLowerCase() !== 'no';
 }
 
+// Active employees first, deactivated ones at the bottom.
+function employeesActiveFirst() {
+  return state.employees.slice().sort((a, b) =>
+    (isActiveEmployee(b) - isActiveEmployee(a)) || (a.employee_number - b.employee_number));
+}
+function empOptionLabel(emp) {
+  return escapeHtml(emp.name) + (isActiveEmployee(emp) ? '' : ' (deactivated)');
+}
+// Name for Admin tables: red with a "deactivated" tag when inactive.
+function empNameCell(emp) {
+  return isActiveEmployee(emp) ? escapeHtml(emp.name)
+    : `<span style="color:var(--bad);">${escapeHtml(emp.name)} <span style="font-size:10.5px; font-weight:700;">DEACTIVATED</span></span>`;
+}
+
 function renderHome(app) {
   const tiles = state.employees.filter(isActiveEmployee).map(emp => `
     <button class="tile" style="--tile-color:${COLORS[emp.color] || COLORS.Gray}"
@@ -921,8 +935,8 @@ function renderAdminEmployees(body) {
   body.innerHTML = `
     <div class="card">
       <h2>Employees</h2>
-      ${state.employees.map(emp => `
-        <div class="emp-row" style="${isActiveEmployee(emp) ? '' : 'opacity:0.6;'}">
+      ${employeesActiveFirst().map(emp => `
+        <div class="emp-row" style="${isActiveEmployee(emp) ? '' : 'background:#FDF0EE; border-left:4px solid var(--bad); padding-left:8px; border-radius:6px;'}">
           <div class="swatch" style="background:${COLORS[emp.color] || COLORS.Gray}"></div>
           <div style="flex:1;">
           <div class="fields">
@@ -934,10 +948,10 @@ function renderAdminEmployees(body) {
             </select>
           </div>
           <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px; font-size:12px; color:var(--ink-soft);">
-            <span>${isActiveEmployee(emp) ? 'Shown to crew' : '<b style="color:var(--bad);">Hidden from crew</b> \u2014 records kept'}</span>
+            <span>${isActiveEmployee(emp) ? 'Active' : '<b style="color:var(--bad);">DEACTIVATED</b> \u2014 hidden from crew, records kept'}</span>
             ${isActiveEmployee(emp)
-              ? `<button class="small danger" onclick="setEmployeeActive(${emp.employee_number}, false)">Hide from crew</button>`
-              : `<button class="small" onclick="setEmployeeActive(${emp.employee_number}, true)">Show again</button>`}
+              ? `<button class="small danger" onclick="setEmployeeActive(${emp.employee_number}, false)">Deactivate</button>`
+              : `<button class="small" onclick="setEmployeeActive(${emp.employee_number}, true)">Reactivate</button>`}
           </div>
           </div>
         </div>
@@ -953,7 +967,7 @@ function renderAdminEmployees(body) {
 async function setEmployeeActive(empNum, active) {
   const emp = state.employees.find(e => e.employee_number === empNum);
   if (!emp) return;
-  if (!active && !confirm(`Hide ${emp.name} from the crew screen?\n\nHe won't be able to clock in. All his past hours and payments stay in Admin.`)) return;
+  if (!active && !confirm(`Deactivate ${emp.name}?\n\nHe disappears from the crew screen and can't clock in. All his past hours and payments stay in Admin, shown in red.`)) return;
   await updateEmployee(empNum, { active: active ? 'Yes' : 'No' });
 }
 
@@ -1042,7 +1056,7 @@ async function applyHoursFixes(btn) {
 function renderAdminPayments(body) {
   const defaults = state.paymentFormDefaults || {};
   const empDefault = (defaults.empNum !== undefined) ? defaults.empNum
-    : (state.employees[0] ? state.employees[0].employee_number : undefined);
+    : (employeesActiveFirst()[0] ? employeesActiveFirst()[0].employee_number : undefined);
   // "From" always starts on this employee's first unpaid day (or today if all paid).
   const fromDefault = firstUnpaidDate(empDefault) || todayStr();
   const toDefault = todayStr();
@@ -1053,7 +1067,7 @@ function renderAdminPayments(body) {
       <h2>Record a payment</h2>
       <label>Employee</label>
       <select id="p_emp" onchange="onPaymentEmployeeChange()">
-        ${state.employees.map(e => `<option value="${e.employee_number}" ${empDefault === e.employee_number ? 'selected' : ''}>${escapeHtml(e.name)}</option>`).join('')}
+        ${employeesActiveFirst().map(e => `<option value="${e.employee_number}" ${empDefault === e.employee_number ? 'selected' : ''}>${empOptionLabel(e)}</option>`).join('')}
       </select>
       <label>Covers days from</label>
       <div class="two-col">
@@ -1446,11 +1460,11 @@ function renderCustomReportSection(cr) {
   const rangeLabel = `${fmtDate(cr.from)} \u2013 ${fmtDate(cr.to)}`;
 
   if (cr.empNum === 'all') {
-    const rows = state.employees.map(emp => {
+    const rows = employeesActiveFirst().map(emp => {
       const entries = state.entries.filter(e => e.employee_number === emp.employee_number && inRange(e));
       const hours = entries.reduce((s, e) => s + Number(e.hours_worked || 0), 0);
       const earned = entries.reduce((s, e) => s + Number(e.amount_earned || 0), 0);
-      return `<tr><td>${escapeHtml(emp.name)}</td><td>${hours}</td><td>${money(earned)}</td></tr>`;
+      return `<tr><td>${empNameCell(emp)}</td><td>${hours}</td><td>${money(earned)}</td></tr>`;
     }).join('');
     return `
       <div class="card" style="overflow-x:auto">
@@ -1505,10 +1519,10 @@ function renderCustomReportSection(cr) {
 }
 
 function renderAdminSummary(body) {
-  const rows = state.employees.map(emp => {
+  const rows = employeesActiveFirst().map(emp => {
     const t = totalsFor(emp.employee_number);
     return `<tr>
-      <td>${escapeHtml(emp.name)}</td>
+      <td>${empNameCell(emp)}</td>
       <td>${money(t.earned)}</td>
       <td>${money(t.wagesPaid)}</td>
       <td><b>${money(t.wagesBalance)}</b></td>
@@ -1545,7 +1559,7 @@ function renderAdminSummary(body) {
       <label>Employee</label>
       <select id="cr_emp">
         <option value="all" ${crEmpDefault === 'all' ? 'selected' : ''}>All Employees</option>
-        ${state.employees.map(e => `<option value="${e.employee_number}" ${crEmpDefault === e.employee_number ? 'selected' : ''}>${escapeHtml(e.name)}</option>`).join('')}
+        ${employeesActiveFirst().map(e => `<option value="${e.employee_number}" ${crEmpDefault === e.employee_number ? 'selected' : ''}>${empOptionLabel(e)}</option>`).join('')}
       </select>
       <div class="two-col">
         <div>
